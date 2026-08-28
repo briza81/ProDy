@@ -1341,7 +1341,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
 
     :arg seed_volume: Smallest void, in cubic Angstrom, that may seed a channel
         search, measured on the cavity scale (Delaunay tetrahedra summed).
-        Default is 30, roughly the van der Waals volume of a water molecule.
+        Default is 50.
 
         It applies to both kinds of search site, on that one scale: to every
         chamber (see ``seed_radius``), and to every cavity, since a cavity holding
@@ -1549,7 +1549,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     CHANNELS_ADVANCED_OPTIONS = {
         'bottleneck': inner_radius,
         'seed_radius': max(1.4, inner_radius),
-        'seed_volume': 30.0,
+        'seed_volume': 50.0,
         'max_seeds': 20,
         'chamber_links': True,
         'restrict_channels_to_start_point': True,
@@ -1841,7 +1841,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     # table reports.
     #
     # Without this a single-tetrahedron sliver of tessellation debris became a
-    # search site of its own whenever min_depth let it through: such a sliver lies
+    # search site bottleneck = min(gatesof its own whenever min_depth let it through: such a sliver lies
     # wholly in the surface layer, so it is its own mouth, and it reports either
     # nothing (sealed, having no target to path to) or a one-step channel that is
     # a facet of the surface rather than a tunnel. A low min_depth is what exposes
@@ -4809,9 +4809,7 @@ def calcSurfaceCavities(atoms, output_path=None, surf_radius=4.5, inner_radius=2
 
         The volume is the cavity's Delaunay tetrahedra summed. Their corners are
         atom centres, so they lie against the wall of the pocket rather than
-        filling it, and the number is not the room inside: on ``dbja_prot`` the
-        largest cavity reports 485 A^3, while the probes that fit at its vertices
-        occupy some 620 A^3 of the space below the surface. Compare a threshold
+        filling it, and the number is not the room inside. Compare a threshold
         against other cavities, then, not against a volume measured some other
         way - and note that a channel volume is on another scale entirely, the
         probe swept along the centerline.
@@ -7659,7 +7657,7 @@ class ChannelCalculator:
         return [best_cavity]
 
     def setStartingTetrahedraFromChambers(self, cavities, labels, volumes,
-                                          min_depth, seed_volume=30.0,
+                                          min_depth, seed_volume=50.0,
                                           max_seeds=None):
         '''Seed every cavity at each of its chambers instead of at its single
         deepest tetrahedron.
@@ -7718,7 +7716,7 @@ class ChannelCalculator:
             cavity scale (Delaunay tetrahedra summed). It is a floor on where a
             search may start, independent of the ``min_volume`` the caller
             applies to the objects it reports, which is measured on the
-            swept-sphere scale instead. ``None`` applies no floor. Default 30.
+            swept-sphere scale instead. ``None`` applies no floor. Default 50.
 
             The caller applies the same floor to the cavities before handing them
             over, so every cavity here has already cleared it: the whole-cavity
