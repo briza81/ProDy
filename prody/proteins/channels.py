@@ -7580,6 +7580,21 @@ class ChannelCalculator:
         that chamber really has. Filtering by depth first and taking the widest
         of what remains keeps the seed inside the site.
 
+        How deep is deep enough is not an absolute length, though, because how
+        far below a mouth a point has to be to be past it is set by how wide that
+        mouth is. `min_depth` is measured in Angstrom while "still in the
+        opening" is measured by the opening's own radius, and under a wide one
+        the two part company: in a porin at ``surf_radius=10`` the widest mouth
+        has a 7.5 A radius, so a tetrahedron 5.3 A down clears `min_depth=5` and
+        is still inside the mouth. Seeding there costs the whole site - every
+        route out of it leaves by that one opening, the dedup cuts them all
+        against it, and the chamber reports a single stub instead of the pore.
+        So the depth floor is raised to the widest opening the cavity has, and
+        the seed has to clear that. Ordinary mouths measure 1-3 A and sit below
+        `min_depth`, which leaves the floor where it was: this only acts once an
+        opening is wider than the depth demanded of a seed, which is where the
+        absolute floor stops meaning what it says.
+
         Cavities are left with the seed `findDeepestTetrahedra` gave them when no
         chamber of theirs qualifies, so a pocket too narrow to hold the chamber
         probe still reports its channels.
@@ -7636,11 +7651,31 @@ class ChannelCalculator:
                 if label >= 0 and volumes[label] >= floor:
                     chambers.setdefault(int(label), []).append(int(tetra))
 
+            # The depth a seed has to clear to be past the mouths, which is
+            # min_depth until an opening is wider than that (see the note above).
+            # The widest opening of the cavity stands for all of them: a seed is
+            # cut against whichever opening its routes reach, not only the
+            # nearest, so clearing the widest is what puts it past every one.
+            # This is the same radius the dedup measures an opening by, so "below
+            # the mouth" means one thing on both sides.
+            mouth = 0.0
+            exit_tetrahedra = getattr(cavity, 'exit_tetrahedra', None)
+            if exit_tetrahedra is not None and len(exit_tetrahedra):
+                mouth = float(np.max(
+                    clearance[np.asarray(exit_tetrahedra, dtype=np.intp)]))
+            seed_depth = max(float(min_depth), mouth)
+
             def widestDeepest(members):
-                """The widest of `members` that is at least `min_depth` deep."""
+                """The widest of `members` that lies below the mouths: no
+                shallower than `seed_depth`, falling back to `min_depth` where a
+                chamber holds nothing that deep, so that a site whose whole
+                extent lies under a wide opening still reports its channels."""
                 members = np.asarray(members, dtype=np.intp)
-                deep = members[np.array([depths.get(int(t), 0.0)
-                                         for t in members]) >= min_depth]
+                member_depths = np.array([depths.get(int(t), 0.0)
+                                          for t in members])
+                deep = members[member_depths >= seed_depth]
+                if len(deep) == 0:
+                    deep = members[member_depths >= min_depth]
                 if len(deep) == 0:
                     return None
                 return int(deep[np.argmax(clearance[deep])])
