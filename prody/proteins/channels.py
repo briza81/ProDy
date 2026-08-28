@@ -1048,7 +1048,7 @@ def showSurfaceCavities(surface, cavities=None, model=None, show_surface=False,
     o3d.visualization.draw_geometries(meshes_to_visualize)
 
 def calcChannels(atoms, output_path=None, separate=False, start_point=None,
-    start_point_search=3.0, surf_radius=3, inner_radius=0.9, min_depth=5,
+    start_point_search=3.0, surf_radius=15, inner_radius=0.9, min_depth=5,
     min_volume=None, max_volume=None, max_depth=None, sparsity=1,
     cavities_only=False, diagram="homogenized", max_deviation=0.1, 
     similarity=0.8, route_tolerance=1.0, return_details=False, **kwargs):
@@ -1128,8 +1128,38 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         seed the nearest tetrahedron as-is.
     :type start_point_search: float
 
-    :arg surf_radius: The first radius threshold used during the deletion of simplices, 
-        which is used to define the outer surface of the channels. Default is 3
+    :arg surf_radius: Radius, in Angstrom, of the probe that says what counts as
+        the outside. The tessellation is eroded from the boundary inward wherever
+        this probe fits, so everything it can reach is exterior and what it cannot
+        enter is the void the channels are traced through. Default is 15.
+
+        It is deliberately large. The erosion is followed by the local peel of
+        ``min_enclosure``, which strips the shell of exterior the probe bridged
+        over rather than entered, so where the erosion *stops* is decided by
+        burial and not by this radius. Above about 3.5 Angstrom the reported
+        channels stop moving: across the test structures the result is identical,
+        channel for channel, from 3.5 up to 20, and the run is no slower at the
+        top of that range than at the bottom. The default sits high in the
+        plateau rather than at its edge.
+
+        What the value has to be large enough for is a wide pore. A probe smaller
+        than the pore passes through it, so the lumen is classified as outside and
+        carved away, and only the pockets around it are reported; the structure is
+        turned inside out with no sign that anything went wrong. The probe must
+        therefore exceed the radius of the widest opening that should count as
+        interior - for a channel-forming protein or a large assembly that is well
+        above the 3 Angstrom values common for compact enzymes, hence the default.
+
+        For a globular protein any value in the plateau gives the same answer, so
+        lowering it is safe but buys nothing. Note that ``calcSurfaceCavities``
+        does not use this default: a surface pocket is shallow and open by
+        definition, and it sets its own, smaller radius.
+
+        One caveat applies to ``diagram="weighted"`` only. That path truncates the
+        Apollonius diagram at ``max(2 * surf_radius, 8)`` Angstrom of clearance, so
+        a large radius here makes an already expensive tessellation much more so.
+        The weighted diagram is experimental; with the default radius, expect it
+        to be impractical on anything but small structures.
     :type surf_radius: float
 
     :arg inner_radius: The second radius threshold used to define the inner surface of
@@ -1201,7 +1231,13 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         using the third-party ``vorpy`` package (with a compiled kernel when
         ``numba`` is available). This is the exact diagram the "homogenized" mode
         approximates, at a higher cost (~ 100x slower, for 4000 atoms). To use this
-        approach install ``vorpy`` library using ``pip install vorpy3``. 
+        approach install ``vorpy`` library using ``pip install vorpy3``.
+
+        Treat "weighted" as experimental. Besides the cost of the tessellation
+        itself, it is the one mode whose diagram depends on ``surf_radius``: it is
+        truncated at ``max(2 * surf_radius, 8)`` Angstrom of clearance, so the
+        default radius makes it far more expensive again, and lowering
+        ``surf_radius`` to keep it affordable is the trade-off to be aware of.
     :type diagram: str
 
     :arg max_deviation: Maximum tolerated deviation, in Angstrom, between the 
@@ -1487,7 +1523,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     
     To save the results as PDB file:
     channels, surface = calcChannels(atoms, output_path="channels.pdb",
-                                     separate=False, surf_radius=3, inner_radius=0.9, min_depth=5,
+                                     separate=False, surf_radius=15, inner_radius=0.9, min_depth=5,
                                      bottleneck=1, sparsity=3) """
 
     # Advanced options, accepted as keyword arguments only and kept out of the
@@ -2409,7 +2445,7 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
 
     Example usage:
     channels_all, surfaces_all = calcChannelsMultipleFrames(atoms, trajectory=traj, 
-                                    output_path="channels.pdb", separate=False, surf_radius=3, 
+                                    output_path="channels.pdb", separate=False, surf_radius=15,
                                     inner_radius=0.9, min_depth=5, bottleneck=1, sparsity=3)
                                   
     channels_all, surfaces_all = calcChannelsMultipleFrames(atoms, trajectory=traj, 
