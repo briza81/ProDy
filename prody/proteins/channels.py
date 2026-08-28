@@ -1103,6 +1103,8 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         after the number - ``out_sp13_lnk0_sp9.pqr`` runs from start point 13
         into start point 9 - so either end can be searched for. Start points are
         numbered largest void first and listed in the log; see ``seed_radius``.
+        A search that ran from a single start point tags nothing with it, every
+        object having the same one, and writes ``out_chl3.pqr``.
     :type separate: bool
 
     :arg start_point: Optional starting point for channel search. This can be
@@ -2069,6 +2071,14 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     for entry in channels + links:
         entry.origin = origins.get(int(np.asarray(entry.tetrahedra)[0]))
 
+    # An sp<n> tag tells one search site's objects from another's, so a run that
+    # searched from a single site has nothing to tell: every object would carry
+    # the same sp0 in its file name and its REMARK. The origins themselves are
+    # kept - they are what the table below counts by - and only the naming is
+    # dropped, so the files come out as chl0.pqr with a REMARK reading
+    # "channel 0" alone, as they did before multi-seed searching.
+    name_sites = len(origins) > 1
+
     # The far end of a link, named the way its near end is. Chamber labels are
     # internal to the carve, so they are translated here, where the start points
     # they stand for have just been numbered.
@@ -2125,21 +2135,35 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
 
         header = ['site', 'void', 'volume [Å³]', 'depth [Å]',
                   'channels', 'links']
+
+        # A single search site names nothing with an sp<n> - every row would be
+        # sp0, and nothing written carries the tag either - and it can hold no
+        # link, which needs a second site to arrive at. Both columns are dropped
+        # there, leaving the one row to say what the void is and what came out
+        # of it. The notes are kept out of the widths, being ragged text at the
+        # end of the row rather than a column of it.
+        keep = range(len(header)) if name_sites else [1, 2, 3, 4]
+        notes = [row[len(header)] for row in rows]
+        rows = [[row[column] for column in keep] for row in rows]
+        header = [header[column] for column in keep]
+        labels = 2 if name_sites else 1
         widths = [max(len(row[column]) for row in [header] + rows)
                   for column in range(len(header))]
 
         def formatRow(row):
-            # The two labels left, the four numbers right, so that a column of
-            # volumes or counts can be compared by eye down the page.
+            # The labels left, the numbers right, so that a column of volumes or
+            # counts can be compared by eye down the page.
             return '    ' + '  '.join(
-                text.ljust(width) if column < 2 else text.rjust(width)
+                text.ljust(width) if column < labels else text.rjust(width)
                 for column, (text, width) in enumerate(zip(row, widths)))
 
         LOGGER.info("Search sites (sp), the void each search ran from, largest "
-                    "first; sp<n> tags every channel, link and output file:")
+                    "first; sp<n> tags every channel, link and output file:"
+                    if name_sites else
+                    "The void the search ran from:")
         LOGGER.info(formatRow(header))
-        for row in rows:
-            LOGGER.info(formatRow(row[:len(header)]) + row[len(header)])
+        for row, note in zip(rows, notes):
+            LOGGER.info(formatRow(row) + note)
         LOGGER.info("    (site volumes measure the void itself and are not on "
                     "the swept-sphere scale of the channel volumes)")
 
@@ -2198,19 +2222,24 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
                 " and {0} links to {1}".format(len(links), links_path)))
         else:
             LOGGER.info("Saving {0} channels{1} to directory {2}, one file per "
-                        "object named sp<site>_chl<n>{3}.".format(
+                        "object named {3}chl<n>{4}.".format(
                             len(channels),
                             '' if not links else
                             " and {0} links".format(len(links)),
                             output_path.parent,
-                            '' if not links else " and sp<site>_lnk<n>"))
+                            'sp<site>_' if name_sites else '',
+                            '' if not links else
+                            " and sp<site>_lnk<n>" if name_sites
+                            else " and lnk<n>"))
         calculator.saveChannelsToPdb(channels, output_path, separate,
-                                     separate_stem=separate_stem)
+                                     separate_stem=separate_stem,
+                                     name_sites=name_sites)
         if links:
             calculator.saveChannelsToPdb(links, links_path, separate,
                                          tag='lnk', label='link',
                                          separate_path=output_path,
-                                         separate_stem=separate_stem)
+                                         separate_stem=separate_stem,
+                                         name_sites=name_sites)
     else:
         LOGGER.info("No output path given.")
 
@@ -7281,7 +7310,7 @@ class ChannelCalculator:
 
     @staticmethod
     def _channelRecords(channel_index, channel, atom_index, num_samples,
-                        label='channel'):
+                        label='channel', name_sites=True):
         """The FIL records of one channel: its REMARK, one ATOM per sampled
         sphere and the CONECT bonds between them.
 
@@ -7292,7 +7321,8 @@ class ChannelCalculator:
 
         # Each channel gets its own residue number so the channels stay
         # separable at the record level, matching saveCavitiesToPdb.
-        lines = [ChannelCalculator._channelRemark(channel_index, channel, label)]
+        lines = [ChannelCalculator._channelRemark(channel_index, channel, label,
+                                                  name_sites)]
         for i, (x, y, z, radius) in enumerate(zip(centers[:, 0], centers[:, 1],
                                                   centers[:, 2], radii),
                                               start=atom_index):
@@ -7309,7 +7339,7 @@ class ChannelCalculator:
 
     def saveChannelsToPdb(self, channels, filename, separate=False, num_samples=5,
                           tag='chl', label='channel', separate_path=None,
-                          separate_stem=None):
+                          separate_stem=None, name_sites=True):
         # ``channels`` is a flat list, already ordered by cost - that order is
         # the order they are written and numbered here. Each channel is preceded
         # by a REMARK reporting its length, bottleneck radius, curvature and cost.
@@ -7321,6 +7351,11 @@ class ChannelCalculator:
         # they come out as ``<stem>_lnk0.pqr`` and not ``<stem>_links_lnk0.pqr``.
         # ``separate_stem=''`` drops the stem from those names altogether, which
         # is what a run told only a directory does.
+        #
+        # ``name_sites=False`` drops the ``sp<n>`` tag from the names and the
+        # REMARKs. It tells the objects of one search site apart from another's,
+        # so it says nothing at all when the run had a single site: there every
+        # channel would carry the same sp0, which is clutter and not a label.
         filename = str(filename)
         separate_path = str(separate_path) if separate_path else filename
 
@@ -7330,7 +7365,7 @@ class ChannelCalculator:
             for channel_index, channel in enumerate(channels):
                 lines, samples = self._channelRecords(channel_index, channel,
                                                       atom_index, num_samples,
-                                                      label)
+                                                      label, name_sites)
                 pqr_file.writelines(lines)
                 pqr_file.write("\n")
                 atom_index += samples
@@ -7345,8 +7380,9 @@ class ChannelCalculator:
                 # <stem>_sp13_lnk0_sp9.pqr. Both ends are then greppable - the
                 # prefix still gathers everything traced out of sp13, and sp9
                 # now matches everything touching sp9 from either side.
-                origin = getattr(channel, 'origin', None)
-                destination = getattr(channel, 'destination', None)
+                origin = getattr(channel, 'origin', None) if name_sites else None
+                destination = (getattr(channel, 'destination', None)
+                               if name_sites else None)
                 object_tag = (tag if origin is None
                               else 'sp{0}_{1}'.format(origin, tag))
                 object_suffix = ('' if origin is None or destination is None
@@ -7357,20 +7393,22 @@ class ChannelCalculator:
 
                 with open(str(channel_filename), 'w') as pqr_file:
                     lines, _ = self._channelRecords(channel_index, channel,
-                                                    1, num_samples, label)
+                                                    1, num_samples, label,
+                                                    name_sites)
                     pqr_file.writelines(lines)
 
     @staticmethod
-    def _channelRemark(channel_index, channel, label='channel'):
+    def _channelRemark(channel_index, channel, label='channel', name_sites=True):
         """One-line PQR/PDB REMARK with a channel's basic geometry:
         length, bottleneck radius, curvature and Dijkstra cost."""
         curv = 'n/a' if np.isnan(channel.curvature) else "%.3f" % channel.curvature
         cost = 'n/a' if channel.cost is None else "%.4g" % channel.cost
         # "from sp13 to sp9" rather than a pair of assignments: both ends of a
         # link are start points, and reading them as a direction is the point.
-        # A channel has only the near end - the far end is the solvent.
-        origin = getattr(channel, 'origin', None)
-        destination = getattr(channel, 'destination', None)
+        # A channel has only the near end - the far end is the solvent. Left off
+        # entirely when the run had one site to name (see saveChannelsToPdb).
+        origin = getattr(channel, 'origin', None) if name_sites else None
+        destination = getattr(channel, 'destination', None) if name_sites else None
         where = '' if origin is None else "  from sp%d" % origin
         if where and destination is not None:
             where += " to sp%d" % destination
