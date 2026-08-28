@@ -1194,11 +1194,12 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
 
         Like ``bottleneck``, it drops entries from the finished list and does not
         change the search: where a search may *start* is set by ``seed_volume``,
-        so raising this to report only the large channels never costs you the
-        seed that finds them. The two are also measured on different scales - a
-        channel volume is the probe sphere swept along the centerline, hence free
-        space, while a cavity or chamber volume sums the Delaunay tetrahedra it
-        holds - so the same number does not mean the same thing on both.
+        the floor on the void - cavity or chamber - a search runs from, so raising
+        this to report only the large channels never costs you the seed that finds
+        them. The two are also measured on different scales - a channel volume is
+        the probe sphere swept along the centerline, hence free space, while a
+        cavity or chamber volume sums the Delaunay tetrahedra it holds - so the
+        same number does not mean the same thing on both.
     :type min_volume: float
 
     :arg max_volume: Maximum volume allowed for a channel/cavity to be 
@@ -1338,15 +1339,31 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         explicit starting point is where the search begins.
     :type seed_radius: float
 
-    :arg seed_volume: Smallest chamber, in cubic Angstrom, that may seed a channel
+    :arg seed_volume: Smallest void, in cubic Angstrom, that may seed a channel
         search, measured on the cavity scale (Delaunay tetrahedra summed).
         Default is 30, roughly the van der Waals volume of a water molecule.
 
-        A chamber under it (see ``seed_radius``) is taken for tessellation debris
-        rather than a site and gets no starting point of its own. Nothing is lost
-        by that, since the cavity around it is searched anyway and a chamber that
-        seeds nothing still conducts. Raise it to seed only the roomy lobes of a
-        branched cavity; ``None`` seeds every chamber found.
+        It applies to both kinds of search site, on that one scale: to every
+        chamber (see ``seed_radius``), and to every cavity, since a cavity holding
+        no chamber is itself searched whole from a seed of its own. A void under it
+        is taken for tessellation debris rather than a site.
+
+        The two cases differ in what that costs. A *chamber* under the floor, in a
+        cavity that clears it, costs nothing: the cavity is searched from its other
+        seeds either way, and a chamber that seeds nothing still conducts, so the
+        routes through it are still found. A *cavity* under the floor is not
+        searched at all, and neither is anything inside it - which is the point:
+        the tessellation leaves single-tetrahedron slivers lying wholly in the
+        surface layer, and such a sliver is its own mouth. It reports either
+        nothing (it has no target to path to, and comes out as sealed) or a
+        one-step channel that is a facet of the surface rather than a tunnel. A low
+        ``min_depth`` is what exposes them in numbers, but nothing except their size
+        tells them from a real void at any depth.
+
+        Raise it to seed only the roomy lobes of a branched cavity; ``None``
+        applies no floor and seeds every cavity and chamber found. Passing
+        ``start_point`` overrides it completely, since an explicit starting point
+        is where the search begins.
 
         It is deliberately not ``min_volume``: that one is a floor on what gets
         *reported*, and tying the two would mean that asking for only the large
@@ -1813,12 +1830,58 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
             start_point_search)
 
     c_filtered_cavities = calculator.filterCavities(c_surface_cavities, min_depth)
-    LOGGER.report('Surface cavities: {0} found, {1} deeper than '
-        'min_depth={2:.1f} Å and {3}, in %.2fs.'.format(
-            len(c_surface_cavities), len(c_filtered_cavities), float(min_depth),
-            'kept' if cavities_only else 'searched for channels'),
-        '_prody_channels_cavities')
-    
+
+    # seed_volume is a floor on where a search may start, and a cavity is a search
+    # site exactly as a chamber is: a cavity holding no chamber is searched whole,
+    # from a seed of its own, and one whose chambers all fall under the floor falls
+    # back to the same. So the floor is applied to the cavities here as well as to
+    # the chambers in setStartingTetrahedraFromChambers, and means one thing
+    # throughout - no void below it seeds a search, whether it is a lobe of a large
+    # cavity or a cavity entire. Both are measured on the Delaunay scale the site
+    # table reports.
+    #
+    # Without this a single-tetrahedron sliver of tessellation debris became a
+    # search site of its own whenever min_depth let it through: such a sliver lies
+    # wholly in the surface layer, so it is its own mouth, and it reports either
+    # nothing (sealed, having no target to path to) or a one-step channel that is
+    # a facet of the surface rather than a tunnel. A low min_depth is what exposes
+    # them - measured at 12 of 15 sites on 1grm and 300+ of 336 on LinB with
+    # min_depth=0 - but nothing except their size distinguishes them at any depth.
+    #
+    # Skipped when start_point is given: the user has said where the search
+    # begins, and that wins over any floor.
+    debris = 0
+    if not cavities_only:
+        calculator.calculate_cavity_volumes(c_filtered_cavities, s_clr.simp,
+                                            coords)
+
+        if start_point is None and seed_volume is not None:
+            searched = calculator.filterCavitiesByVolume(
+                c_filtered_cavities, min_volume=seed_volume)
+            debris = len(c_filtered_cavities) - len(searched)
+            if debris and not searched:
+                _warn('every cavity is smaller than seed_volume={0:g} Å³, so no '
+                      'search site is left and no channel can be found. Lower '
+                      'seed_volume, or set it to None, to search the small '
+                      'cavities too.'.format(float(seed_volume)))
+            c_filtered_cavities = searched
+
+    if debris:
+        report = ('Cavities: {0} found, {1} deeper than min_depth={2:.1f} Å, {3} '
+                  'of them at least seed_volume={4:g} Å³ and searched for '
+                  'channels; the {5} smaller ones are tessellation debris and are '
+                  'left unsearched, in %.2fs.').format(
+                      len(c_surface_cavities), len(c_filtered_cavities) + debris,
+                      float(min_depth), len(c_filtered_cavities),
+                      float(seed_volume), debris)
+    else:
+        report = ('Cavities: {0} found, {1} deeper than min_depth={2:.1f} Å and '
+                  '{3}, in %.2fs.').format(
+                      len(c_surface_cavities), len(c_filtered_cavities),
+                      float(min_depth),
+                      'kept' if cavities_only else 'searched for channels')
+    LOGGER.report(report, '_prody_channels_cavities')
+
     if cavities_only:
         if max_depth is not None:
             calculator.trimCavitiesByDepth(c_filtered_cavities, max_depth)
@@ -1832,9 +1895,8 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         if min_volume is not None or max_volume is not None:
             c_filtered_cavities = calculator.filterCavitiesByVolume(
                 c_filtered_cavities, min_volume, max_volume)
-    else:
-        calculator.calculate_cavity_volumes(c_filtered_cavities, s_clr.simp,
-                                            coords)
+    # The channel path has its volumes already: they are what the seed_volume
+    # floor above was applied to.
 
     # Largest first. Cavities come out of findGroups in connected-component
     # order, which follows tetrahedron indices, so cavity 0 was whichever void
@@ -2023,6 +2085,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         "never reaches the surface)".format(
             len(links), '' if len(links) == 1 else 's')))
 
+    sealed = 0
     if origin_rows:
         # One row per site, in the order the sites are numbered. Laid out as a
         # table because every row says the same six things: written as sentences
@@ -2051,7 +2114,10 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
             if not (traced or linked):
                 # Why the site reports nothing; the bottleneck it failed and
                 # what to do about it are in the summary line below the table.
+                # Counted here rather than recomputed there, so that the number
+                # in that line is the number of rows marked here by definition.
                 note = '  sealed'
+                sealed += 1
             rows.append(['sp{0}'.format(index), where, '{0:.0f}'.format(volume),
                          '{0:.1f}'.format(depth),
                          str(len(traced)) if traced else '-',
@@ -2077,26 +2143,27 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         LOGGER.info("    (site volumes measure the void itself and are not on "
                     "the swept-sphere scale of the channel volumes)")
 
-    # A chamber can end up reporting nothing at all: its own channels dropped by
-    # the dedup as duplicates of a shallower chamber's shorter ones, and its link
-    # then dropped by the bottleneck filter because the neck it would leave
-    # through is too tight for the probe. That is a real finding - the chamber is
-    # sealed at this width - but an invisible one, because nothing is written
-    # about a chamber that reports no object, and the void simply goes missing
-    # from the output.
-    if chamber_labels is not None:
-        reported = set()
-        for objects in (channels, links):
-            for entry in objects:
-                reported.add(int(np.asarray(entry.tetrahedra)[0]))
-        sealed = sum(1 for cavity in c_filtered_cavities
-                     for seed in cavity.seed_chambers if int(seed) not in reported)
-        if sealed:
-            LOGGER.info("The {0} site{1} marked sealed above report neither a "
-                        "channel nor a link: every route out of them is "
-                        "narrower than bottleneck={2:.2f} Å. Lower it to see "
-                        "how they connect.".format(
-                            sealed, '' if sealed == 1 else 's', bottleneck))
+    # A site can end up reporting nothing at all: its own channels dropped by the
+    # dedup as duplicates of a shallower site's shorter ones, and its link then
+    # dropped by the bottleneck filter because the neck it would leave through is
+    # too tight for the probe. That is a real finding - the void is sealed at this
+    # width - but an invisible one, because nothing is written about a site that
+    # reports no object, and the void simply goes missing from the output.
+    #
+    # A cavity searched whole is a site on the same terms as a chamber, so it is
+    # counted here on the same terms: the count is the number of rows the table
+    # marked sealed, whichever kind of void they name. Counting only the chamber
+    # seeds (cavity.seed_chambers) made the summary contradict the table it
+    # summarises - "The 1 site marked sealed above" under a table marking
+    # hundreds.
+    if sealed:
+        LOGGER.info("The {0} site{1} marked sealed above report neither a "
+                    "channel nor a link: no route out of them survived - either "
+                    "narrower than bottleneck={2:.2f} Å, or dropped as a "
+                    "duplicate of a shallower site's, or the void is its own "
+                    "mouth and has nowhere to path to. Lower bottleneck to see "
+                    "how the first kind connect.".format(
+                        sealed, '' if sealed == 1 else 's', bottleneck))
 
     if output_path:
         output_path = Path(output_path)
@@ -7652,6 +7719,11 @@ class ChannelCalculator:
             search may start, independent of the ``min_volume`` the caller
             applies to the objects it reports, which is measured on the
             swept-sphere scale instead. ``None`` applies no floor. Default 30.
+
+            The caller applies the same floor to the cavities before handing them
+            over, so every cavity here has already cleared it: the whole-cavity
+            fallback below decides only *where* in a cavity to start, never
+            whether it is a site at all.
         :type seed_volume: float or None
 
         :arg max_seeds: cap on the seeds of one cavity, widest chamber first.
@@ -7738,7 +7810,9 @@ class ChannelCalculator:
                 # would keep the deepest tetrahedron findDeepestTetrahedra picked,
                 # which is chosen without reference to width - and since every
                 # channel of the cavity leaves through its seed, a narrow one caps
-                # all of their bottlenecks. 
+                # all of their bottlenecks. The cavity has already cleared
+                # seed_volume in the caller, so this is a choice of seed and not a
+                # way back in for a void the floor excluded.
                 seed = widestDeepest(tetrahedra)
                 if seed is not None:
                     cavity.setStartingTetrahedron(np.array([seed]))
