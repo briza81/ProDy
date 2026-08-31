@@ -1049,7 +1049,7 @@ def showSurfaceCavities(surface, cavities=None, model=None, show_surface=False,
 
 def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     start_point_search=3.0, surf_radius=15, inner_radius=1.2, min_depth=5,
-    min_volume=None, max_volume=None, max_depth=None, sparsity=1,
+    min_volume=None, max_volume=None, max_depth=None, sparsity=6,
     cavities_only=False, diagram="homogenized", max_deviation=0.1, 
     similarity=0.8, route_tolerance=2.0, return_details=False, **kwargs):
     """Computes and identifies channels within a molecular structure using 
@@ -1210,15 +1210,17 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         retained. Default is None.
     :type max_volume: float
 
-    :arg sparsity: Size of a channel surface opening (mouth), in Angstrom: how far
-        apart two exits must lie to count as separate openings. It is a floor on
-        the radius of a reported opening, so two channels leaving closer than
-        ``sparsity`` are treated as sharing that opening and are merged if they
-        also share a corridor (see ``similarity``); being applied *after* the
-        search, it can only merge channels there, never hide one, and is a
+    :arg sparsity: Smallest centre-to-centre distance, in Angstrom, at which two
+        channel surface openings (mouths) still count as separate. Two channels
+        leaving closer than this are treated as sharing one opening and are merged
+        if they also take the same corridor (see ``similarity``). It acts as a
+        floor: where the tessellation already measures the two mouths as wider
+        than ``sparsity``, their own radii decide instead, so the value only sets
+        the minimum separation a reported pair of openings can have. Being applied
+        *after* the search, it can only merge channels, never hide one, and is a
         reporting preference rather than part of the geometry. A higher value
         reports fewer channels. It has no effect on the cavities, which are found
-        from the exit tetrahedra before any thinning. Default is 1.
+        from the exit tetrahedra before any merging. Default is 6.
     :type sparsity: float
 
     :arg diagram: 
@@ -1821,9 +1823,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     c_cavities = calculator.findGroups(s_clr.neigh)
     c_surface_cavities = calculator.getSurfaceCavities(c_cavities, s_clr.simp,
                                                        l_second_layer_simp,
-                                                       s_clr, coords,
-                                                       vdw_radii, sparsity,
-                                                       mouth_oracle)
+                                                       s_clr, mouth_oracle)
 
     calculator.findDeepestTetrahedra(c_surface_cavities, s_clr.neigh, s_clr.verti,
                                      coords, s_clr.simp)
@@ -4820,11 +4820,12 @@ def calcSurfaceCavities(atoms, output_path=None, surf_radius=4.5, inner_radius=2
     :type max_depth: float
 
     :arg sparsity: Deprecated and ignored; accepted only so that existing calls
-        keep working. It never affected surface cavities: it thinned the sampling
-        of the mouth (exit) tetrahedra used as termini by the *channel* search,
-        and no cavity property reads that thinned set. Cavity extent, depth,
-        volume and filtering are all derived from the unthinned exit tetrahedra,
-        so passing 1 or 15 returns the same cavities.
+        keep working. It never affected surface cavities. In :func:`calcChannels`
+        it is the smallest separation at which two channel openings still count
+        as separate, applied when the finished channels are deduplicated, and no
+        cavity property reads it. Cavity extent, depth, volume and filtering are
+        all derived from the exit tetrahedra, so passing 1 or 15 returns the same
+        cavities.
     :type sparsity: int
 
     :arg min_tetrahedra: Minimum number of tetrahedra required for a cavity to
@@ -4883,9 +4884,9 @@ def calcSurfaceCavities(atoms, output_path=None, surf_radius=4.5, inner_radius=2
 
     if sparsity is not None:
         _warn("sparsity is deprecated in calcSurfaceCavities and is "
-              "ignored. It thinned the mouth tetrahedra sampled as termini "
-              "by the channel search; cavities are built from the unthinned "
-              "ones, so it never changed them.")
+              "ignored. It separates the openings of finished channels in "
+              "calcChannels; cavities are built from the exit tetrahedra "
+              "before that, so it never changed them.")
 
     # No peel (min_enclosure=0). The enclosure peel strips the shell of true
     # exterior that a large surf_radius probe bridges over instead of entering, because it
@@ -4905,7 +4906,7 @@ def calcSurfaceCavities(atoms, output_path=None, surf_radius=4.5, inner_radius=2
     return cavities, surface
 
 def scanChannelParameters(atoms, inner_radius_values=(1.2, 1.4, 1.6),
-    sparsity_values=(1.0, 3.0, 5.0), min_depth_values=(3.0, 5.0, 10.0),
+    sparsity_values=(2.0, 6.0, 10.0), min_depth_values=(3.0, 5.0, 10.0),
     output_path='channel_parameter_grid', resolution=0.5, max_proc=2,
     start_point=None, **kwargs):
     """Calculate channels over a combination grid of parameters.
@@ -4925,8 +4926,8 @@ def scanChannelParameters(atoms, inner_radius_values=(1.2, 1.4, 1.6),
         ``(1.2, 1.4, 1.6)``.
     :type inner_radius_values: float or sequence of float
 
-    :arg sparsity_values: Mouth-separation values tested in the grid. Default is
-        ``(1.0, 3.0, 5.0)``.
+    :arg sparsity_values: Mouth-separation values, in Angstrom, tested in the
+        grid. Default is ``(2.0, 6.0, 10.0)``.
     :type sparsity_values: float or sequence of float
 
     :arg min_depth_values: Minimum cavity depths tested in the grid. Default is
@@ -4961,7 +4962,7 @@ def scanChannelParameters(atoms, inner_radius_values=(1.2, 1.4, 1.6),
 
     Example usage:
     channels_all, parameter_sets, occupancy_file = scanChannelParameters(
-        protein, inner_radius_values=[1.2, 1.4, 1.6], sparsity_values=[1, 3, 5],
+        protein, inner_radius_values=[1.2, 1.4, 1.6], sparsity_values=[2, 6, 10],
         min_depth_values=[3, 5, 10], output_path='channel_parameter_grid') """
 
     from itertools import product
@@ -5568,9 +5569,8 @@ class Cavity:
     def makeSurface(self):
         self.is_connected_to_surface = True
         
-    def setExitTetrahedra(self, exit_tetrahedra, end_tetrahedra):
+    def setExitTetrahedra(self, exit_tetrahedra):
         self.exit_tetrahedra = exit_tetrahedra
-        self.end_tetrahedra = end_tetrahedra
         
     def setStartingTetrahedron(self, tetrahedron):
         self.starting_tetrahedron = tetrahedron
@@ -5611,7 +5611,7 @@ class ChannelCalculator:
     # true width.
     CAVITY_MARKER_RADIUS = 1.00
 
-    def __init__(self, atoms, inner_radius=0.9, sparsity=1, route_tolerance=1.0,
+    def __init__(self, atoms, inner_radius=1.2, sparsity=6, route_tolerance=2.0,
                  edge_cost='integral'):
         # Only the parameters the class actually consults are held here. surf_radius,
         # min_depth and bottleneck are stages of the pipeline, applied to the
@@ -6276,7 +6276,7 @@ class ChannelCalculator:
         return labels, self.calculateChamberVolumes(labels, simplices, points)
 
     def getSurfaceCavities(self, cavities, interior_simplices, second_layer,
-                           state, points, vdw_radii, sparsity, mouth_oracle=None):
+                           state, mouth_oracle=None):
         surface_cavities = []
         
         for cavity in cavities:
@@ -6297,8 +6297,7 @@ class ChannelCalculator:
                     if len(exit_tetrahedra) == 0:
                         continue
                 cavity.makeSurface()
-                end_tetrahedra = self.getEndTetrahedra(exit_tetrahedra, state.verti, points, vdw_radii, state.simp, sparsity)
-                cavity.setExitTetrahedra(exit_tetrahedra, end_tetrahedra)
+                cavity.setExitTetrahedra(exit_tetrahedra)
                 surface_cavities.append(cavity)
                 
         return surface_cavities
@@ -6659,10 +6658,11 @@ class ChannelCalculator:
         # sum-based test in deleteSimplices3d to the per-atom clearance), so the
         # test is a no-op there; it earns its keep for diagram="simple", where
         # unequal radii break that identity.
-        # Local indices of the tetrahedra a channel is allowed to end at.
-        terminals_local = [global_to_local[int(t)]
-                           for t in np.asarray(cavity.end_tetrahedra)
-                           if int(t) in global_to_local]
+        # Local indices of the tetrahedra a channel is allowed to end at; filled
+        # from the mouths below. A surface cavity always has exit tetrahedra (it
+        # is classified as one by having them), so this stays empty only for a
+        # cavity that should produce no channels at all.
+        terminals_local = []
         exit_tetra = np.asarray(getattr(cavity, 'exit_tetrahedra',
                                         np.empty(0, dtype=np.intp)))
         if len(exit_tetra):
@@ -6769,9 +6769,10 @@ class ChannelCalculator:
             # A channel ends where it first touches the surface, i.e. at whichever
             # mouth absorbed it - so emit a candidate for every *reachable* mouth,
             # not for a pre-sampled subset of them. Sampling the targets before the
-            # search (the old `end_tetrahedra`, thinned by `sparsity`) can pick a
-            # target that sits behind another mouth: the path is absorbed at that
-            # nearer mouth and can go no further, the sampled target is never
+            # search (as an earlier version did, thinning the mouths by `sparsity`
+            # first) can pick a target that sits behind another mouth: the path is
+            # absorbed at that nearer mouth and can go no further, the sampled
+            # target is never
             # reached, and because only sampled targets emit channels the tunnel is
             # reported nowhere at all. Which mouth happens to shadow which target is
             # a tessellation accident, so real tunnels vanished at some meshes and
@@ -6985,9 +6986,41 @@ class ChannelCalculator:
             # sibling paths peel off in the last few Angstrom and end on
             # neighbouring exit tetrahedra. Counting that splay as divergence is
             # what used to report one tunnel as a bundle of near-copies.
+            #
+            # The opening test is SYMMETRIC: two exits are one opening when
+            # their mouth spheres overlap, not when one centre falls inside the
+            # other's sphere. A one-sided test is measuring the wrong thing -
+            # it asks whether a sibling exit lands in the middle of the kept
+            # mouth, whereas the question is whether the two mouths are the same
+            # hole. Sibling exits land on neighbouring tetrahedra all around one
+            # opening, so they sit roughly a mouth radius apart, and the
+            # one-sided test then answers "different opening" for a pair whose
+            # spheres overlap almost completely and whose corridors are
+            # identical. Because that test runs first, the corridor comparison
+            # never gets to speak: the pair is reported twice however tightly
+            # `similarity` is set.
+            # `sparsity` is a centre-to-centre DISTANCE between openings, so the
+            # floor it puts on a single opening radius is half of it: two exits
+            # whose clearances are both below the floor merge exactly when they
+            # are closer than `sparsity`, which is what the argument promises.
+            if cut is None:
+                own_radius = max(self.calculateMaxRadius(
+                    pts[-1], points, vdw_radii,
+                    simplices[tetra[-1]]), self.sparsity / 2.0)
+            else:
+                # A cut route ends at an interior tetrahedron that merely lies
+                # inside a reported exit volume (see the inheritance note
+                # below); its inscribed sphere is not a mouth, so it lends no
+                # radius of its own to the test. It needs none against the
+                # opening that cut it - it is inside that one by construction -
+                # and letting an interior sphere widen the test against every
+                # other opening is exactly the promotion the cut path is
+                # denied everywhere else.
+                own_radius = 0.0
+
             duplicate = False
             for _kc, kpts, kxyz, kr in kept:
-                if np.linalg.norm(pts[-1] - kxyz) >= kr:
+                if np.linalg.norm(pts[-1] - kxyz) >= kr + own_radius:
                     continue                        # a different opening
                 if self._routeCoverage(pts, kpts, center=kxyz,
                                        radius=kr) >= similarity:
@@ -7015,11 +7048,9 @@ class ChannelCalculator:
                     # The clearance at the exit vertex measures the mouth, but on a
                     # coarse tessellation it is erratic and can collapse to almost
                     # nothing, fragmenting one physical mouth into several; the
-                    # sparsity floor keeps it mesh-independent.
+                    # `sparsity / 2` floor keeps it mesh-independent.
                     opening_xyz = pts[-1]
-                    opening_radius = max(self.calculateMaxRadius(
-                        pts[-1], points, vdw_radii,
-                        simplices[tetra[-1]]), self.sparsity)
+                    opening_radius = own_radius
                 kept.append((channel, pts, opening_xyz, opening_radius))
                 centres = np.vstack((centres, opening_xyz))
                 radii = np.append(radii, opening_radius)
@@ -7176,51 +7207,6 @@ class ChannelCalculator:
         radii = np.array([self.calculateMaxRadius(voronoi_vertices[tetra], points, vdw_radii, simp[tetra]) for tetra in tetrahedra])
         max_radius_index = np.argmax(radii)
         return tetrahedra[max_radius_index]
-
-    def getEndTetrahedra(self, tetrahedra, voronoi_vertices, points, vdw_radii, 
-                         simp, sparsity):
-        # Greedy sparse sampling of the mouth (exit) tetrahedra: seed with the
-        # widest tetrahedron, then repeatedly add the widest tetrahedron that is
-        # still at least `sparsity` away from every already-selected one, until
-        # none qualify. Vectorized rewrite of the former O(N_exit x M^2) double
-        # loop (which called np.linalg.norm once per candidate/selected pair and
-        # re-scanned radii via findBiggestTetrahedron every pass):
-        #   * the "far enough from all selected" test is exactly "running min
-        #     distance to the selected set >= sparsity", so keep one min_dist
-        #     array and fold in each new pick with a single vectorized norm;
-        #   * inscribed radii are geometry-only, so precompute them once instead
-        #     of recomputing find_biggest over the shrinking candidate set.
-        # Selection order and argmax first-tie-break match the original, so the
-        # returned end tetrahedra are identical.
-        tetrahedra = np.asarray(tetrahedra)
-        n = len(tetrahedra)
-        if n == 0:
-            return tetrahedra
-
-        verts = voronoi_vertices[tetrahedra]            # (n, 3) circumcenters
-        radii = np.array([
-            self.calculateMaxRadius(voronoi_vertices[tetra], points, 
-                                    vdw_radii, simp[tetra])
-            for tetra in tetrahedra])
-
-        min_dist = np.full(n, np.inf)
-        selected = np.zeros(n, dtype=bool)
-        order = []
-
-        current = int(np.argmax(radii))             # widest tetrahedron (seed)
-        while True:
-            order.append(current)
-            selected[current] = True
-            min_dist = np.minimum(min_dist, np.linalg.norm(verts - verts[current], axis=1))
-
-            feasible = (min_dist >= sparsity) & ~selected   # >= sparsity from every pick
-            if not feasible.any():
-                break
-            # widest feasible tetrahedron; np.argmax breaks ties toward the
-            # lowest index, matching the original input-order scan.
-            current = int(np.argmax(np.where(feasible, radii, -np.inf)))
-
-        return tetrahedra[order]
 
     def filterCavities(self, cavities, min_depth):
         return [cavity for cavity in cavities if cavity.depth >= min_depth]
