@@ -1048,10 +1048,10 @@ def showSurfaceCavities(surface, cavities=None, model=None, show_surface=False,
     o3d.visualization.draw_geometries(meshes_to_visualize)
 
 def calcChannels(atoms, output_path=None, separate=False, start_point=None,
-    start_point_search=3.0, surf_radius=15, inner_radius=0.9, min_depth=5,
+    start_point_search=3.0, surf_radius=15, inner_radius=1.2, min_depth=5,
     min_volume=None, max_volume=None, max_depth=None, sparsity=1,
     cavities_only=False, diagram="homogenized", max_deviation=0.1, 
-    similarity=0.8, route_tolerance=1.0, return_details=False, **kwargs):
+    similarity=0.8, route_tolerance=2.0, return_details=False, **kwargs):
     """Computes and identifies channels within a molecular structure using 
     Voronoi and Delaunay tessellations.
 
@@ -1165,16 +1165,18 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     :type surf_radius: float
 
     :arg inner_radius: The second radius threshold used to define the inner surface of
-        the channels. Default is 0.9.
+        the channels. Default is 1.2, which is the smallest value safe on a
+        structure without hydrogens.
 
         Below about 1.2 Angstrom the probe is smaller than a water molecule, and
         then the structure must carry explicit hydrogens. Without them, every
         carbon keeps its full vdW radius while the space its hydrogens occupied is
         left empty, and a sub-water probe is small enough to thread those
         interstices: the interior percolates into a sponge and the channel count
-        can rise several-fold. At 1.2 Angstrom and above, protonated and 
-        unprotonated structures give the same channels, and an X-ray file may
-        be used as it comes. A warning is issued for the unsafe combination.
+        can rise several-fold. At 1.2 Angstrom and above, protonated and
+        unprotonated structures give similar channels, and an X-ray file may
+        be used as it comes. A warning is issued for the unsafe combination, so
+        go below the default only on a protonated structure.
 
         Note that this sets where channels are traced, not how wide the reported
         ones end up being: a channel can be narrower than ``inner_radius`` at its
@@ -1282,7 +1284,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     :arg route_tolerance: How far apart, in Angstrom, two centerlines may drift
         and still count as the same corridor when computing ``similarity``. Larger values merge more
         aggressively (nearby parallel routes read as one tunnel); smaller values
-        report finer route variants separately. Default is 1.0.
+        report finer route variants separately. Default is 2.0.
     :type route_tolerance: float
 
     :arg return_details: If True return an additional dictionary containing
@@ -1542,8 +1544,8 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     
     To save the results as PDB file:
     channels, surface = calcChannels(atoms, output_path="channels.pdb",
-                                     separate=False, surf_radius=15, inner_radius=0.9, min_depth=5,
-                                     bottleneck=1, sparsity=3) """
+                                     separate=False, surf_radius=15, inner_radius=1.2, min_depth=5,
+                                     bottleneck=1, sparsity=6) """
 
     # Advanced options, accepted as keyword arguments only and kept out of the
     # signature above, which is long enough already. These are settings a normal
@@ -1677,7 +1679,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
               "channels will be found through interstices that do not exist in the "
               "real protein (their number can rise several-fold). Either add "
               "hydrogens, or raise inner_radius to 1.2 Å or more, where protonated and "
-              "unprotonated structures give the same channels.".format(inner_radius))
+              "unprotonated structures give similar channels.".format(inner_radius))
 
     if diagram == "simple":
         # 'simple' builds an *unweighted* Delaunay of the atom centres, i.e. it
@@ -2542,7 +2544,7 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
     Example usage:
     channels_all, surfaces_all = calcChannelsMultipleFrames(atoms, trajectory=traj, 
                                     output_path="channels.pdb", separate=False, surf_radius=15,
-                                    inner_radius=0.9, min_depth=5, bottleneck=1, sparsity=3)
+                                    inner_radius=1.2, min_depth=5, bottleneck=1, sparsity=6)
                                   
     channels_all, surfaces_all = calcChannelsMultipleFrames(atoms, trajectory=traj, 
                                     output_path="channels.pdb", separate=False, 
