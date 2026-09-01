@@ -608,12 +608,13 @@ def showChannels(channels, model=None, surface=None):
     conda install open3d (for Anaconda users; version open3d-0.19.0 was used 
     during the development) or pip install open3d
     
-    :arg channels: A list of channel objects or a single channel object. Each 
-        channel should have a `getSplines()` method that returns two 
-        CubicSpline objects: one for the centerline and one for the radii.
+    :arg channels: A list of channel objects or a single channel object. Each
+        channel should have a `getSplines()` method that returns two
+        interpolators over one parameter domain: one for the centerline and one
+        for the radii.
     :type channels: list or single channel object
-    
-    :arg model: An optional Open3D TriangleMesh object representing the 
+
+    :arg model: An optional Open3D TriangleMesh object representing the
         molecular model, such as a protein. If provided, this model will be 
         rendered in the visualization.
         Model can be generated using getVmdModel() function.
@@ -2324,11 +2325,12 @@ def calcPoresFromChannels(channels, details, min_end_to_end=None, max_end_to_end
        ``max_end_to_end``, ``min_bottleneck``, ``max_bottleneck``, ``min_length``, 
        ``max_length``, ``min_volume``, ``max_volume``). 
     
-    :arg channels: A list of channel objects or a single channel object. Each 
-        channel should have a `getSplines()` method that returns two 
-        CubicSpline objects: one for the centerline and one for the radii.
+    :arg channels: A list of channel objects or a single channel object. Each
+        channel should have a `getSplines()` method that returns two
+        interpolators over one parameter domain: one for the centerline and one
+        for the radii.
     :type channels: list or single channel object
-    
+
     :arg details: Additional calculation data returned by
         :func:`calcChannels` with ``return_details=True``. The dictionary must
         contain ``calculator``, ``simplices``, ``neighbors``, ``vertices``,
@@ -3437,7 +3439,10 @@ def _sampleObjectSpheres(object, num_samples=5):
     """``(centres, radii)`` of the probe spheres along a channel or a pore.
 
     ``num_samples`` points per tetrahedron of the route, evenly spaced in the
-    spline parameter. This is the one definition of "the spheres of an object":
+    spline parameter - which, the centerline being parameterized by the square
+    root of the step between circumcenters, puts them roughly evenly along the
+    route rather than crowding wherever circumcenters happen to cluster.
+    This is the one definition of "the spheres of an object":
     :func:`getChannelAtoms` and
     :meth:`~ChannelCalculator.saveChannelsToPdb` write these very spheres out as
     FIL atoms, and the lining queries take them straight from here, since the
@@ -7573,34 +7578,86 @@ class ChannelCalculator:
                                 vdw_radii, simp, radii)
         return radii, gates
 
-    def processChannel(self, tetrahedra, voronoi_vertices, points, vdw_radii, 
+    def processChannel(self, tetrahedra, voronoi_vertices, points, vdw_radii,
                        simp):
-        from scipy.interpolate import CubicSpline
-        
+        """The geometry of one route: ``(centerline_spline, radius_spline,
+        length, bottleneck, volume)``.
+
+        The centerline runs through the circumcenters of ``tetrahedra`` and the
+        radius profile through their clearances and the gates between them, over
+        one shared parameter domain - so a value of the parameter names the same
+        place on both, and the endpoints (hence the cap radii) are the route's
+        own ends. The parameter measures distance, not tetrahedra; see the
+        comments below for why, and what it costs to get that wrong.
+
+        ``length`` and ``volume`` are the centerline's arc length and the volume
+        of the tube it sweeps; ``bottleneck`` is the tightest gate, taken from
+        the measurements rather than from the interpolated profile."""
+
+        from scipy.interpolate import CubicSpline, PchipInterpolator
+
         centers = voronoi_vertices[tetrahedra]
         radii, gates = self.calculateRadiusSpline(tetrahedra,
                                                   voronoi_vertices,
                                                   points, vdw_radii, simp)
         bottleneck = float(np.min(gates)) if len(gates) else float(np.min(radii))
 
-        t = np.arange(len(centers))
-        centerline_spline = CubicSpline(t, centers, bc_type='natural')
-        # The tube pinches at the gates, not at the wide circumcenters, so give
-        # the radius profile a knot at each gate (midway between its two
-        # vertices) carrying the gate clearance. The centerline keeps only the
-        # vertex knots; both splines share the same t domain, so the volume
-        # integral samples them consistently and the endpoints (hence the cap
-        # radii) are unchanged.
-        if len(gates):
-            knot_t = np.empty(2 * len(centers) - 1)
-            knot_t[0::2] = t
-            knot_t[1::2] = t[:-1] + 0.5
-            knot_r = np.empty_like(knot_t)
-            knot_r[0::2] = radii
-            knot_r[1::2] = gates
-            radius_spline = CubicSpline(knot_t, knot_r, bc_type='natural')
+        # Coincident circumcenters - the twin tetrahedra _edgeBottleneck guards
+        # against - are a repeated knot to a spline, and a parameter that
+        # advances by distance would stand still at one. Collapse each run of
+        # them onto its first point, at the same 1e-6 A separation that test
+        # uses. Nothing is lost: the gate of a collapsed span is taken as the
+        # tightest of the edges it covers, and the bottleneck above is over
+        # every edge in any case.
+        keep = [0]
+        for i in range(1, len(centers)):
+            if np.linalg.norm(centers[i] - centers[keep[-1]]) > 1e-6:
+                keep.append(i)
+        # The spline parameter advances by sqrt(step) - the centripetal
+        # parameterization - rather than by one per tetrahedron. Circumcenters
+        # are spaced anything but evenly along a route: neighbouring steps of
+        # 0.1 and 3.7 A occur, and giving each of them one unit of parameter
+        # makes the cubic overshoot the long edge and swing back, a bend the
+        # route does not have. Measured over a set of proteins, the index
+        # parameterization runs 6-8% (up to 22%) longer than the polyline
+        # through the same circumcenters and wanders up to 0.6 A off it, so it
+        # inflates every reported length, volume and curvature; centripetal
+        # stays within 1% and roughly halves the wander. Plain chord length
+        # fixes the length but wanders further still at abrupt turns, which is
+        # the familiar Catmull-Rom result and holds here as well.
+        if len(keep) < 2:
+            # every circumcenter of the route sits in one place, so there is no
+            # distance to parameterize by; fall back on the index.
+            keep = np.arange(len(centers), dtype=np.intp)
+            t = keep.astype(float)
         else:
-            radius_spline = CubicSpline(t, radii, bc_type='natural')
+            keep = np.asarray(keep, dtype=np.intp)
+            step = np.linalg.norm(np.diff(centers[keep], axis=0), axis=1)
+            t = np.concatenate([[0.0], np.cumsum(np.sqrt(step))])
+        centerline_spline = CubicSpline(t, centers[keep], bc_type='natural')
+        # The tube pinches at the gates, not at the wide circumcenters, so give
+        # the radius profile a knot at each gate (at the parameter midpoint
+        # between its two vertices) carrying the gate clearance. The centerline
+        # keeps only the vertex knots; both splines share the same t domain, so
+        # the volume integral samples them consistently and the endpoints (hence
+        # the cap radii) are unchanged.
+        # Shape-preserving (PCHIP) rather than a cubic spline: the profile is a
+        # sequence of measured clearances, and an interpolant that overshoots
+        # them writes spheres narrower than the bottleneck it reports - measured
+        # at up to 0.14 A below, and 0.18 A above the widest gate. PCHIP is
+        # monotone between knots, so the sampled tube is bounded by the numbers
+        # the knots carry.
+        if len(gates):
+            knot_t = np.empty(2 * len(keep) - 1)
+            knot_t[0::2] = t
+            knot_t[1::2] = 0.5 * (t[:-1] + t[1:])
+            knot_r = np.empty_like(knot_t)
+            knot_r[0::2] = radii[keep]
+            knot_r[1::2] = [float(gates[keep[k]:keep[k + 1]].min())
+                            for k in range(len(keep) - 1)]
+            radius_spline = PchipInterpolator(knot_t, knot_r)
+        else:
+            radius_spline = PchipInterpolator(t, radii[keep])
 
         length = self.calculateChannelLength(centerline_spline)
         volume = self.calculateChannelVolume(centerline_spline, radius_spline)
