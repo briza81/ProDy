@@ -374,7 +374,7 @@ def _calcPoresFromChannelsWorker(args):
                                  separate=separate, **kwargs)
 
 
-def _reportAtomsInputComposition(atoms):
+def _reportAtomsInputComposition(atoms, inner_radius=None, diagram=None):
     """Report the composition of atoms supplied for channel analysis.
 
     This function checks whether the input atomic structure contains only
@@ -383,52 +383,169 @@ def _reportAtomsInputComposition(atoms):
     issued indicating that all supplied atoms will be included in the channel
     calculation.
 
+    It also reads how far the structure is protonated, and reports where that
+    sits badly with the run about to be made: a probe smaller than water on a
+    structure missing its hydrogens, hydrogens present but unused because the
+    probe was left at the size an unprotonated structure needs, or a
+    radius-blind diagram on a structure whose radii vary most.
+
     The function does not modify or filter the input structure. To analyze only
     the protein, the user should provide an appropriate ProDy selection, for
-    example ``atoms.select('protein')``. """
-    
+    example ``atoms.select('protein')``.
+
+    :arg inner_radius: probe radius the run will use, if known. Judged against
+        the hydrogen content; omit it to skip that pair of checks.
+    :type inner_radius: float
+
+    :arg diagram: Voronoi diagram the run will use, if known. Omit it to skip
+        the check on radius-blind tessellation.
+    :type diagram: str """
+
     if not isinstance(atoms, Atomic):
         raise TypeError(
             "atoms must be a ProDy Atomic object, such as an AtomGroup "
             "or Selection")
 
     protein = atoms.select('protein')
+    nucleic = atoms.select('nucleic')
     water = atoms.select('water')
     hetero = atoms.select('hetero and not water')
-    other = atoms.select('not protein and not hetero')
-    nonprotein = atoms.select('not protein')
+    other = atoms.select('not protein and not nucleic and not hetero')
+    # Nucleic acid is part of the biomolecule the channels run through, not something
+    # that found its way into the selection, so it is named alongside the protein
+    # rather than counted among the components worth warning about.
+    foreign = atoms.select('not protein and not nucleic')
 
-    if nonprotein is None:
-        LOGGER.info("The atoms supplied to calcChannels contain protein atoms only.")
-        return
+    if foreign is None:
+        LOGGER.info("The atoms supplied to calcChannels contain {0} atoms only.".format(
+            " and ".join(name for name, selection in (('protein', protein),
+                                                      ('nucleic acid', nucleic))
+                         if selection is not None)))
+    else:
+        components = []
 
-    components = []
+        if water is not None:
+            components.append(
+                "water: {0} atoms in {1} residues".format(
+                    water.numAtoms(),
+                    len(np.unique(water.getResindices()))))
 
-    if water is not None:
-        components.append(
-            "water: {0} atoms in {1} residues".format(
-                water.numAtoms(),
-                len(np.unique(water.getResindices()))))
+        if hetero is not None:
+            components.append(
+                "non-water hetero components: {0} atoms "
+                "(resnames: {1})".format(
+                    hetero.numAtoms(),
+                    ", ".join(sorted(np.unique(hetero.getResnames())))))
 
-    if hetero is not None:
-        components.append(
-            "non-water hetero components: {0} atoms "
-            "(resnames: {1})".format(
-                hetero.numAtoms(),
-                ", ".join(sorted(np.unique(hetero.getResnames())))))
+        if other is not None:
+            components.append(
+                "other components: {0} atoms "
+                "(resnames: {1})".format(
+                    other.numAtoms(),
+                    ", ".join(sorted(np.unique(other.getResnames())))))
 
-    if other is not None:
-        components.append(
-            "other non-protein components: {0} atoms "
-            "(resnames: {1})".format(
-                other.numAtoms(),
-                ", ".join(sorted(np.unique(other.getResnames())))))
+        # The advice names only what the structure actually holds, so a protein with
+        # a ligand is still pointed at 'protein' and only a complex is told about
+        # the wider selection.
+        present = [(name, keyword) for name, keyword, selection in
+                   (('protein', 'protein', protein),
+                    ('nucleic acid', 'nucleic', nucleic)) if selection is not None]
+        _warn("The atoms supplied to calcChannels() contain components other than "
+            "{1}: {0}. All supplied atoms except waters will be used for channel "
+            "analysis. To analyze only the {1}, provide an appropriate selection, "
+            "for example atoms.select('{2}').".format(
+                "; ".join(components),
+                " and ".join(name for name, _ in present),
+                " or ".join(keyword for _, keyword in present)))
 
-    _warn("The atoms supplied to calcChannels() contain non-protein components: "
-        "{0}. All supplied atoms except waters will be used for channel analysis. "
-        "To analyze only the protein structure, provide an appropriate "
-        "selection, for example atoms.select('protein').".format(
-            "; ".join(components)))
+    # How far the structure is protonated, measured on the biomolecule alone: waters
+    # are dropped before the diagram is built, and a solvated but otherwise bare
+    # structure would look protonated through its water hydrogens. Each kind of chain
+    # is scored against the hydrogens per heavy atom it should carry, since those
+    # differ: the standard amino acids hold about as many hydrogens as heavy atoms,
+    # so a complete protein sits near 1.0, while a nucleotide is much richer in heavy
+    # atoms -- phosphate oxygens and ring nitrogens bear none -- so a complete nucleic
+    # acid sits near 0.55. A mixed structure counts as protonated only when every kind
+    # of chain in it is, because hydrogens missing anywhere open interstices wherever
+    # the channel happens to run.
+    chains = [(selection, name, expected) for selection, name, expected in
+              ((protein, 'protein', 1.0), (nucleic, 'nucleic acid', 0.55))
+              if selection is not None]
+    if not chains:
+        rest = atoms.select('not water')
+        if rest is None:
+            return
+        chains = [(rest, 'structure', 1.0)]
+
+    n_hydrogen = 0
+    scarcest = None
+    for selection, name, expected in chains:
+        elements = np.char.upper(np.asarray(selection.getElements(), dtype=str))
+        count = int(np.count_nonzero(elements == 'H'))
+        heavy = int(np.count_nonzero(elements != 'H'))
+        n_hydrogen += count
+        # Fraction of the hydrogens a complete chain of this kind would carry, which
+        # puts protein and nucleic acid on one scale.
+        fraction = count / float(max(heavy, 1)) / expected
+        if scarcest is None or fraction < scarcest[0]:
+            scarcest = (fraction, name, count)
+
+    # A complete file scores within a few percent of 1.0, one that kept only its polar
+    # hydrogens about a fifth of that, and one straight from a refinement nothing, so
+    # the threshold has a wide margin either side and is not delicate.
+    fully_protonated = scarcest[0] >= 0.7
+
+    # An experimental structure generally carries no hydrogens -- X-ray and cryo-EM
+    # alike, since neither resolves them except at the very highest resolutions -- and
+    # its carbons keep their full vdW radius, so the ~0.6 A the missing H occupied is
+    # left as void, around every heavy atom at once, including buried contacts that
+    # never come apart. That is usually harmless, and is often defended as standing in
+    # for thermal motion: a probe of water size cannot enter those interstices anyway,
+    # and protonated and unprotonated runs agree from about 1.2 A upwards. Below that
+    # the probe is small enough to thread them and the interior percolates into a
+    # sponge rather than merely widening. Those routes might be fictitious, not the real
+    # ones made wider. So a sub-water probe needs real hydrogens -- all of them, since
+    # it is the apolar C-H that fill those interstices, and a structure holding only
+    # its polar hydrogens leaves them just as open as one holding none.
+    if inner_radius is not None and inner_radius < 1.2 and not fully_protonated:
+        _warn("inner_radius={0:.2f} is below 1.2 Å but the {1} {2}: the space "
+              "left by the missing H is then wide enough for the probe to pass, and "
+              "channels will be found through interstices that do not exist in the "
+              "real structure (their number can rise several-fold). Either add "
+              "hydrogens, or raise inner_radius to 1.2 Å or more, where protonated and "
+              "unprotonated structures give similar channels.".format(
+                  inner_radius, scarcest[1],
+                  "carries no hydrogens" if not scarcest[2] else
+                  "carries only {0:.0f}% of the hydrogens a complete one would".format(
+                      100.0 * scarcest[0])))
+
+    # The reverse mismatch. The 1.2 A floor above is a workaround for absent
+    # hydrogens, not a property of the probe, so a structure that carries them is
+    # being measured with a probe coarser than its own detail: narrow connections
+    # are reported closed rather than measured. Only a note -- nothing is wrong with
+    # the result, it is simply more conservative than the input requires.
+    if inner_radius is not None and inner_radius >= 1.2 and fully_protonated:
+        LOGGER.info("The structure carries its hydrogens ({0:.0f}% of what a complete "
+            "{1} would hold), so inner_radius={2:.2f} is more conservative than it needs "
+            "to be: the 1.2 Å floor exists only to keep a sub-water probe out of the "
+            "space that missing hydrogens leave open, and here that space is filled. A "
+            "smaller probe, down to about 0.9 Å, measures the narrow connections instead "
+            "of reporting them closed.".format(
+                100.0 * scarcest[0], scarcest[1], inner_radius))
+
+    # 'simple' builds an *unweighted* Delaunay of the atom centres, i.e. it
+    # ignores the differences between atomic radii. That approximation is worst
+    # when the radius spread is largest -- which is exactly when hydrogens (small
+    # vdW) are present -- so warn there and steer the user to a radius-aware mode.
+    # With H absent the heavy-atom radii are much closer, so 'simple' is more
+    # defensible and matches the heavy-atom-only input most tools accept (at the
+    # cost of over-large empty space where the missing H would sit).
+    if diagram == "simple" and n_hydrogen:
+        _warn("diagram='simple' with hydrogens present: the unweighted "
+            "Voronoi diagram ignores radius differences, which are largest when H "
+            "are present, so its topology and clearances are significantly less "
+            "accurate. Consider diagram='homogenized' (or 'weighted'), which "
+            "account for per-atom radii.")
 
 
 def getVmdModel(vmd_path, atoms, representation='NewCartoon'):
@@ -1183,7 +1300,15 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         can rise several-fold. At 1.2 Angstrom and above, protonated and
         unprotonated structures give similar channels, and an X-ray file may
         be used as it comes. A warning is issued for the unsafe combination, so
-        go below the default only on a protonated structure.
+        go below the default only on a fully protonated structure -- partial
+        protonation does not count, since it is the apolar hydrogens that fill
+        those interstices.
+
+        The floor is a workaround for absent hydrogens rather than a property of
+        the probe, so on a structure that carries them the default is coarser
+        than the input deserves and narrow connections are reported closed
+        instead of measured. That case is noted too, and about 0.9 Angstrom is
+        then a reasonable probe.
 
         Note that this sets where channels are traced, not how wide the reported
         ones end up being: a channel can be narrower than ``inner_radius`` at its
@@ -1655,47 +1780,11 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
                          "integral cannot price. Use edge_cost='bottleneck' (the "
                          "default for diagram='weighted') or None.")
     
-    _reportAtomsInputComposition(atoms)
+    _reportAtomsInputComposition(atoms, inner_radius, diagram)
     atoms = atoms.select('not water') # water is excluded from the selection
     calculator = ChannelCalculator(atoms, inner_radius=inner_radius, sparsity=sparsity,
                                    route_tolerance=route_tolerance,
                                    edge_cost=edge_cost)
-
-    elements = np.char.upper(np.asarray(atoms.getElements(), dtype=str))
-    has_hydrogens = bool(np.any(elements == 'H'))
-
-    # An experimental structure generally carries no hydrogens -- X-ray and cryo-EM
-    # alike, since neither resolves them except at the very highest resolutions -- and
-    # its carbons keep their full vdW radius, so the ~0.6 A the missing H occupied is
-    # left as void, around every heavy atom at once, including buried contacts that
-    # never come apart. That is usually harmless, and is often defended as standing in
-    # for thermal motion: a probe of water size cannot enter those interstices anyway,
-    # and protonated and unprotonated runs agree from about 1.2 A upwards. Below that
-    # the probe is small enough to thread them and the interior percolates into a
-    # sponge rather than merely widening. Those routes might be fictitious, not the real
-    # ones made wider. So a sub-water probe needs real hydrogens.
-    if not has_hydrogens and inner_radius < 1.2:
-        _warn("structure has no hydrogens and inner_radius={0:.2f} is below 1.2 Å: the space "
-              "left by the missing H is then wide enough for the probe to pass, and "
-              "channels will be found through interstices that do not exist in the "
-              "real protein (their number can rise several-fold). Either add "
-              "hydrogens, or raise inner_radius to 1.2 Å or more, where protonated and "
-              "unprotonated structures give similar channels.".format(inner_radius))
-
-    if diagram == "simple":
-        # 'simple' builds an *unweighted* Delaunay of the atom centres, i.e. it
-        # ignores the differences between atomic radii. That approximation is worst
-        # when the radius spread is largest -- which is exactly when hydrogens (small
-        # vdW) are present -- so warn there and steer the user to a radius-aware mode.
-        # With H absent the heavy-atom radii are much closer, so 'simple' is more
-        # defensible and matches the heavy-atom-only input most tools accept (at the
-        # cost of over-large empty space where the missing H would sit).
-        if has_hydrogens:
-            _warn("diagram='simple' with hydrogens present: the unweighted "
-                "Voronoi diagram ignores radius differences, which are largest when H "
-                "are present, so its topology and clearances are significantly less "
-                "accurate. Consider diagram='homogenized' (or 'weighted'), which "
-                "account for per-atom radii.")
 
     coords = atoms.getCoords()
     vdw_radii = calculator.getVdwRadii(atoms.getElements())
