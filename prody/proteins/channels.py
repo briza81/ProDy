@@ -1101,6 +1101,13 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         the seed tetrahedron itself is picked. Coordinates must be given in Å.
         If an atomic selection is provided, its geometric center is used as the
          starting point.
+
+        A start point names a site, so it does more than move a seed: the search
+        is restricted to the single cavity holding the tetrahedron nearest the
+        point, and channels are reported for that site alone rather than one
+        bundle per cavity in the structure. The automatic passes that decide
+        where to start are skipped with it -- the chamber seeding and the
+        ``seed_volume`` floor both defer to the point.
     :type start_point: list, tuple, or ndarray (length 3), :class:`.Atomic`, or None
 
     :arg start_point_search: Only used when ``start_point`` is provided. Radius,
@@ -1110,10 +1117,24 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         caps all of their bottlenecks and appears as one shared bottleneck at the
         joint beginning of the bundle. Seeded instead is the widest tetrahedron within
         ``start_point_search`` of ``start_point`` that belongs to the same cavity, is
-        no shallower than the nearest one (so the seed cannot drift out towards the
-        mouth) and is reachable from it through that neighbourhood (so it stays in the
-        void the point sits in rather than crossing a wall). Default is 3.0; use 0 to
-        seed the nearest tetrahedron as-is.
+        at least ``min_depth`` below the surface (so the seed cannot drift out towards
+        the mouth) and is reachable from the nearest one through that neighbourhood (so
+        it stays in the void the point sits in rather than crossing a wall). The seed
+        may therefore sit a little shallower than ``start_point`` itself, which is
+        usually placed on a ligand or a catalytic residue and often lies deeper than
+        the widest part of the pocket around it.
+
+        It is a requirement and not only a search budget: the search must begin
+        within this distance of the point, and if no cavity has a tetrahedron that
+        close, no channels are computed and a warning reports how far the nearest one
+        is and where it lies, so that ``start_point`` can be corrected or
+        ``start_point_search`` raised. Seeding the nearest tetrahedron however far
+        away it sits would answer a point that misses the void -- the centroid of a
+        residue selection often lands inside an atom -- with channels through whatever
+        cavity happens to lie nearest, and nothing in the result would say so.
+
+        Default is 3.0; use 0 to seed the nearest tetrahedron as-is, which asks for no
+        neighbourhood and so imposes no distance requirement either.
     :type start_point_search: float
 
     :arg surf_radius: Radius, in Angstrom, of the probe that says what counts as
@@ -1475,15 +1496,6 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         the ``surf_radius`` dependence that ``min_enclosure`` exists to remove.
     :type max_peel_depth: float or None
         
-    :arg restrict_channels_to_start_point: Only used when ``start_point`` is
-        provided. If True (default), the channel search is restricted to the
-        single cavity whose closest tetrahedron is globally nearest to
-        ``start_point``, so  channels are computed only for the region around
-        that point instead of one channel bundle per detected cavity. If False,
-        ``start_point`` merely overrides the seed (starting) tetrahedron of
-        every cavity and channels are still computed for all cavities.
-    :type restrict_channels_to_start_point: bool
-
     :arg edge_cost: How each Voronoi edge is priced in the Dijkstra tunnel search.
         ``"integral"`` prices each edge by the integral of its clearance profile
         along the edge, which is mesh-invariant. ``"bottleneck"`` uses the legacy
@@ -1547,7 +1559,6 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         'seed_volume': 50.0,
         'max_seeds': 20,
         'chamber_links': True,
-        'restrict_channels_to_start_point': True,
         'min_enclosure': 0.70,
         'max_peel_depth': None,
         'edge_cost': None,
@@ -1574,7 +1585,6 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     seed_volume = options['seed_volume']
     max_seeds = options['max_seeds']
     chamber_links = options['chamber_links']
-    restrict_channels_to_start_point = options['restrict_channels_to_start_point']
     min_enclosure = options['min_enclosure']
     max_peel_depth = options['max_peel_depth']
     edge_cost = options['edge_cost']
@@ -1819,8 +1829,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     if start_point is not None:
         c_surface_cavities = calculator.setStartingTetrahedraFromPoint(
             c_surface_cavities, s_clr.verti, start_point, coords, vdw_radii,
-            s_clr.simp, s_clr.neigh, restrict_channels_to_start_point,
-            start_point_search)
+            s_clr.simp, s_clr.neigh, start_point_search, min_depth)
 
     c_filtered_cavities = calculator.filterCavities(c_surface_cavities, min_depth)
 
@@ -2500,11 +2509,13 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         Default is False.
     :type separate: bool
 
-    :arg start_point: Optional starting point for channel search. If provided, 
-        the algorithm will use the tetrahedron whose Voronoi vertex is closest 
-        to this point as the starting tetrahedron (overriding the default automatic 
-        seed selection based on the deepest tetrahedron). Coordinates must be given in Å.
-    :type start_point: list, tuple, or ndarray (length 3), or None 
+    :arg start_point: Optional starting point for channel search, applied to every
+        frame. If provided, the search is restricted to the cavity holding the
+        tetrahedron nearest the point and is seeded there, overriding the default
+        automatic seed selection; see :func:`calcChannels` for how the seed is
+        picked and for ``start_point_search``, which bounds how far from the point
+        it may lie. Coordinates must be given in Å.
+    :type start_point: list, tuple, or ndarray (length 3), or None
 
     :arg max_proc: Maximum number of parallel processes used for calculation. 
         If 1, files are processed serially. If None, all available CPU
@@ -6310,10 +6321,10 @@ class ChannelCalculator:
 
     def mergeCavities(self, cavities, simplices):
         if not cavities:
-            # No cavities survived filtering (e.g. restrict_channels_to_start_point
-            # selected a single cavity shallower than min_depth). Return an empty
-            # (0, 4) slice so the pipeline yields zero channels instead of crashing
-            # in np.concatenate on an empty list.
+            # No cavities survived filtering (e.g. a start_point selected a single
+            # cavity shallower than min_depth, or none within start_point_search).
+            # Return an empty (0, 4) slice so the pipeline yields zero channels
+            # instead of crashing in np.concatenate on an empty list.
             return simplices[np.empty(0, dtype=np.intp)]
         merged_tetrahedra = np.concatenate([cavity.tetrahedra for cavity in cavities])
         return simplices[merged_tetrahedra]
@@ -7912,7 +7923,7 @@ class ChannelCalculator:
         return total_volume
             
     def selectSeedTetrahedron(self, cavity, vertices, points, vdw_radii, simp,
-                              neighbors, sp, search_radius):
+                              neighbors, sp, search_radius, min_depth):
         '''Map `sp` to the seed tetrahedron of one cavity.
 
         The tetrahedron nearest `sp` (the anchor) is frequently a tight one, and every
@@ -7920,21 +7931,41 @@ class ChannelCalculator:
         their bottlenecks, and the shared first links show up as one common bottleneck
         at the joint beginning of the bundle. So the anchor only says where to look.
         The seed is the widest (largest inscribed radius) tetrahedron of this cavity
-        that lies within `search_radius` of `sp`, is no shallower than the anchor, and
-        is reachable from the anchor through the tetrahedra within `search_radius`.
-        Reachability is over the adjacency of the cleared tetrahedra, which is free
-        space, so the seed can only move through the void the start point sits in and
-        never hops across a wall into a lobe that merely passes nearby; the depth floor
-        keeps it from sliding outward towards the mouth, where tetrahedra are wide but
-        no longer inside the site. Note that the floor filters the seed, not the walk:
-        a marginally shallower cell in between must not wall off the wider region
-        behind it.
+        that lies within `search_radius` of `sp`, is buried deeply enough to still be
+        inside the site, and is reachable from the anchor through the tetrahedra within
+        `search_radius`. Reachability is over the adjacency of the cleared tetrahedra,
+        which is free space, so the seed can only move through the void the start point
+        sits in and never hops across a wall into a lobe that merely passes nearby; the
+        depth floor keeps it from sliding outward towards the mouth, where tetrahedra
+        are wide but no longer inside the site. Note that the floor filters the seed,
+        not the walk: a marginally shallower cell in between must not wall off the
+        wider region behind it.
+
+        The floor is `min_depth`, raised to the widest mouth of the cavity wherever an
+        opening is wider than that -- the same rule, and for the same reason, that
+        :meth:`setStartingTetrahedraFromChambers` applies to an automatically placed
+        seed. It is deliberately not the anchor's own depth. A start point is placed by
+        hand, usually on a bound ligand or a catalytic residue, and such a point
+        routinely sits deeper than the widest part of the pocket around it; held to the
+        anchor's depth the search then finds nothing eligible and leaves the seed on
+        the narrow cell nearest the point, capping every channel of the site at that
+        radius, which is the outcome the search exists to prevent -- and it fails
+        silently, since a pocket whose every route reports the same bottleneck looks
+        like a narrow pocket. Anything above the floor is inside the site by the
+        measure the module uses everywhere else, so a seed somewhat shallower than the
+        point is a seed in the same pocket. How much of the width the search can
+        actually reach from there is then a question of `search_radius` alone.
+
+        Where nothing in reach clears the raised floor the plain `min_depth` is tried,
+        for a site lying wholly under a wide opening, and failing that the anchor's own
+        depth, which always leaves at least the anchor itself.
 
         `search_radius` <= 0 restores the plain nearest-vertex seed.
 
         :returns: dict of the seed and anchor properties (`seed`, `anchor`, and their
             `_vertex`, `_distance` from `sp`, inscribed `_radius` and `_depth`), plus
-            the number of tetrahedra `searched` and how many of them were `eligible`'''
+            the number of tetrahedra `searched`, how many of them were `eligible`, and
+            the depth `floor` they had to clear'''
 
         from collections import deque
 
@@ -7951,16 +7982,23 @@ class ChannelCalculator:
                     vertices[tetra], points, vdw_radii, simp[tetra])),
                 depth=float(depths.get(tetra, 0.0)))
 
-        def report(seed, searched, eligible):
-            info = {'seed': seed, 'anchor': anchor,
-                    'searched': searched, 'eligible': eligible}
+        def report(seed, searched, eligible, floor):
+            info = {'seed': seed, 'anchor': anchor, 'searched': searched,
+                    'eligible': eligible, 'floor': float(floor)}
             for name, tetra in (('seed', seed), ('anchor', anchor)):
                 for key, value in properties(tetra).items():
                     info['{0}_{1}'.format(name, key)] = value
             return info
 
+        anchor_depth = float(depths.get(anchor, 0.0))
+
         if not search_radius or search_radius <= 0:
-            return report(anchor, 1, 1)
+            return report(anchor, 1, 1, anchor_depth)
+
+        def clearances(tetrahedra):
+            atoms = simp[tetrahedra]
+            return np.min(np.linalg.norm(points[atoms] - vertices[tetrahedra][:, None, :],
+                                         axis=2) - vdw_radii[atoms], axis=1)
 
         near = set(int(t) for t, close in zip(tet, d2 <= search_radius ** 2) if close)
 
@@ -7977,26 +8015,52 @@ class ChannelCalculator:
                     reachable.append(neighbor)
                     queue.append(neighbor)
 
-        anchor_depth = depths.get(anchor, 0)
-        eligible = [t for t in reachable if depths.get(t, 0) >= anchor_depth]
+        # How far down a seed has to be to be past the openings. The widest mouth
+        # of the cavity stands for all of them, since a route out of the seed is
+        # cut against whichever opening it reaches. _vertex_clearance is not built
+        # yet at seeding time, so the radii are measured here.
+        mouth = 0.0
+        exits = getattr(cavity, 'exit_tetrahedra', None)
+        if exits is not None and len(exits):
+            mouth = float(np.max(clearances(np.asarray(exits, dtype=np.intp))))
 
-        reach = np.array(eligible, dtype=np.intp)
-        atoms = simp[reach]
-        clearance = (np.linalg.norm(points[atoms] - vertices[reach][:, None, :], axis=2)
-                     - vdw_radii[atoms])
-        radii = clearance.min(axis=1)
-        # The anchor is eligible and comes first (BFS order), so argmax ties to it.
-        best = int(np.argmax(radii))
+        reach = np.array(reachable, dtype=np.intp)
+        radii = clearances(reach)
+        reach_depths = np.array([depths.get(int(t), 0.0) for t in reach])
 
-        return report(int(reach[best]), len(reachable), len(eligible))
+        # The anchor's depth closes the list because it always keeps the anchor,
+        # so some candidate always survives.
+        for floor in (max(float(min_depth), mouth), float(min_depth), anchor_depth):
+            eligible = np.flatnonzero(reach_depths >= floor)
+            if len(eligible):
+                break
+
+        # The anchor comes first (BFS order), so a tie goes to it where it qualifies.
+        best = int(reach[eligible[int(np.argmax(radii[eligible]))]])
+
+        return report(best, len(reachable), len(eligible), floor)
 
     def setStartingTetrahedraFromPoint(self, cavities, vertices, start_point,
                                        points, vdw_radii, simp, neighbors,
-                                       restrict=False, search_radius=5.0):
-        '''Set starting tetrahedra using a user-defined 3D point.
-        The starting tetrahedron of a cavity is the widest one `selectSeedTetrahedron`
-        finds in the neighbourhood of `start_point`; with ``search_radius=0`` it is
-        simply the one whose Voronoi vertex is closest to `start_point`.
+                                       search_radius=5.0, min_depth=5.0):
+        '''Restrict the search to the cavity `start_point` names, and seed it there.
+
+        The starting tetrahedron is the widest one `selectSeedTetrahedron` finds in
+        the neighbourhood of `start_point`; with ``search_radius=0`` it is simply the
+        one whose Voronoi vertex is closest to `start_point`. The cavity holding it is
+        the only one returned: a start point says which site to search, and channels
+        are computed for that site instead of one bundle per cavity in the structure.
+
+        `search_radius` is a requirement and not a hint. A cavity is a candidate only
+        if it holds a tetrahedron within that distance of `start_point`, and where no
+        cavity does, none is seeded and no channels are computed. The alternative is
+        to seed the nearest tetrahedron however far away it is, which is precisely the
+        seed the caller did not ask for: a start point that misses the void -- the
+        centroid of a residue selection routinely lands inside an atom -- is then
+        answered with channels through whatever cavity happens to lie nearest, and
+        nothing in the result says so. Refusing instead, and reporting where the
+        nearest tetrahedron actually is, lets the point be corrected. ``search_radius``
+        of 0 asks for no neighbourhood at all and so imposes no such distance either.
 
         :arg cavities: list of cavity objects
         :arg vertices: Voronoi vertices (array of shape (n, 3))
@@ -8006,57 +8070,65 @@ class ChannelCalculator:
         :arg vdw_radii: per-atom van der Waals radii (array of shape (n_atoms,))
         :arg simp: simplices (tetrahedron -> its 4 atom indices)
         :arg neighbors: tetrahedron adjacency (tetrahedron -> its 4 neighbours, -1 none)
-        :arg restrict: if True, only the single cavity whose closest tetrahedron is
-            globally nearest to `start_point` is seeded and returned, so channels are
-            computed exclusively for the region around `start_point`. If False (default),
-            every cavity is seeded with its own seed tetrahedron and all cavities are
-            returned unchanged.
-        :type restrict: bool
         :arg search_radius: radius, in Angstrom, of the neighbourhood of `start_point`
-            searched for a wider seed. 0 disables the search.
+            a seed must lie in. 0 disables both the search for a wider seed and the
+            distance requirement.
         :type search_radius: float
-        :returns: list of cavities to search: all cavities when `restrict` is False, the
-            single selected cavity when `restrict` is True, or an empty list if no cavity
-            has any tetrahedra'''
+        :arg min_depth: depth floor, in Angstrom, a seed must clear, so that the search
+            for a wider one cannot drift out of the site; raised per cavity to its
+            widest mouth. The same value that filters the cavities themselves.
+        :type min_depth: float
+        :returns: a single-element list holding the selected cavity, or an empty list
+            if no cavity has a tetrahedron within `search_radius` of `start_point`'''
 
         sp = np.asarray(start_point, dtype=float).reshape(3,)
 
-        best_cavity = None
-        best_info = None
-
-        for i, cavity in enumerate(cavities):
+        # Anchor every cavity by distance alone. The cavity the point names is the
+        # one holding the nearest tetrahedron, and that is settled here rather than
+        # by the seed search: widening moves the seed inside a cavity, it must never
+        # decide between cavities. `min` returns the first of any tie, so cavities
+        # equidistant from the point resolve in their original order.
+        anchored = []
+        for cavity in cavities:
             tet = cavity.tetrahedra
             if tet is None or len(tet) == 0:
                 continue
+            tet = np.asarray(tet)
+            distances = np.linalg.norm(vertices[tet] - sp, axis=1)
+            nearest = int(np.argmin(distances))
+            anchored.append((float(distances[nearest]), cavity, int(tet[nearest])))
 
-            info = self.selectSeedTetrahedron(
-                cavity, vertices, points, vdw_radii, simp, neighbors, sp, search_radius)
-
-            if not restrict:
-                cavity.setStartingTetrahedron(np.array([info['seed']]))
-                self.reportSeedTetrahedron(info, search_radius, cavity_index=i)
-
-            # The cavity is still chosen by proximity to start_point: widening moves the
-            # seed inside a cavity, it must never decide between cavities.
-            if best_info is None or info['anchor_distance'] < best_info['anchor_distance']:
-                best_info = info
-                best_cavity = cavity
-
-        if not restrict:
-            return cavities
-
-        if best_cavity is None:
+        if not anchored:
             _warn("start_point was provided but no cavity contains any "
                 "tetrahedron; no channels will be computed.")
             return []
 
-        best_cavity.setStartingTetrahedron(np.array([best_info['seed']]))
-        self.reportSeedTetrahedron(best_info, search_radius)
-        LOGGER.info("    restricting the channel search to the cavity that contains it "
-            "({0} tetrahedra, depth {1:.1f} Å).".format(len(best_cavity.tetrahedra),
-                                                        float(best_cavity.depth)))
+        distance, cavity, tetra = min(anchored, key=lambda entry: entry[0])
 
-        return [best_cavity]
+        if search_radius and search_radius > 0 and distance > search_radius:
+            vertex = vertices[tetra]
+            radius = float(self.calculateMaxRadius(vertex, points, vdw_radii,
+                                                   simp[tetra]))
+            _warn("start_point [{0:.3f}, {1:.3f}, {2:.3f}] has no cavity tetrahedron "
+                "within start_point_search={3:.1f} Å; the nearest one is {4:.3f} Å away "
+                "at [{5:.3f}, {6:.3f}, {7:.3f}] (inscribed radius {8:.3f} Å). No "
+                "channels will be computed. Move start_point towards that vertex, or "
+                "raise start_point_search above {4:.3f} Å to accept it."
+                .format(sp[0], sp[1], sp[2], float(search_radius), distance,
+                        vertex[0], vertex[1], vertex[2], radius))
+            return []
+
+        info = self.selectSeedTetrahedron(
+            cavity, vertices, points, vdw_radii, simp, neighbors, sp,
+            search_radius, min_depth)
+
+        cavity.setStartingTetrahedron(np.array([info['seed']]))
+        self.reportSeedTetrahedron(info, search_radius)
+        LOGGER.info("    restricting the channel search to the cavity that contains it "
+            "({0} tetrahedra, depth {1:.1f} Å).".format(len(cavity.tetrahedra),
+                                                        float(cavity.depth)))
+
+        return [cavity]
 
     def setStartingTetrahedraFromChambers(self, cavities, labels, volumes,
                                           min_depth, seed_volume=50.0,
@@ -8252,31 +8324,31 @@ class ChannelCalculator:
 
         return reseeded, notes
 
-    def reportSeedTetrahedron(self, info, search_radius, cavity_index=None):
+    def reportSeedTetrahedron(self, info, search_radius):
         '''Log the seed tetrahedron `selectSeedTetrahedron` picked, and, when it is not
         the one nearest the start point, the anchor it replaced -- the two radii are what
         tell the user whether the seed was capping the bottlenecks of the cavity.'''
 
-        where = '' if cavity_index is None else ' of cavity {0}'.format(cavity_index)
-        LOGGER.info("start_point seeded at tetrahedron {0}{1} (Voronoi vertex at "
-            "[{2:.3f}, {3:.3f}, {4:.3f}], {5:.3f} Å from start_point, inscribed radius "
-            "{6:.3f} Å, depth {7:.1f} Å)."
-            .format(info['seed'], where, info['seed_vertex'][0], info['seed_vertex'][1],
+        LOGGER.info("start_point seeded at tetrahedron {0} (Voronoi vertex at "
+            "[{1:.3f}, {2:.3f}, {3:.3f}], {4:.3f} Å from start_point, inscribed radius "
+            "{5:.3f} Å, depth {6:.1f} Å)."
+            .format(info['seed'], info['seed_vertex'][0], info['seed_vertex'][1],
                     info['seed_vertex'][2], info['seed_distance'], info['seed_radius'],
                     info['seed_depth']))
 
         if info['seed'] != info['anchor']:
             LOGGER.info("    widened from the nearest tetrahedron {0} ({1:.3f} Å away, "
                 "inscribed radius {2:.3f} Å, depth {3:.1f} Å), the widest of the {4} tetrahedra "
-                "no shallower than it among the {5} reachable within {6:.1f} Å; seeding "
+                "at least {5:.1f} Å deep among the {6} reachable within {7:.1f} Å; seeding "
                 "the narrow one would have capped every channel here at its radius."
                 .format(info['anchor'], info['anchor_distance'], info['anchor_radius'],
-                        info['anchor_depth'], info['eligible'], info['searched'],
-                        float(search_radius)))
+                        info['anchor_depth'], info['eligible'], info['floor'],
+                        info['searched'], float(search_radius)))
         elif search_radius and search_radius > 0:
-            LOGGER.info("    already the widest of the {0} tetrahedra no shallower than "
-                "it among the {1} reachable within {2:.1f} Å."
-                .format(info['eligible'], info['searched'], float(search_radius)))
+            LOGGER.info("    already the widest of the {0} tetrahedra at least {1:.1f} Å "
+                "deep among the {2} reachable within {3:.1f} Å."
+                .format(info['eligible'], info['floor'], info['searched'],
+                        float(search_radius)))
 
 
     def trimCavitiesByDepth(self, cavities, max_depth):
