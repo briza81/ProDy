@@ -21,7 +21,7 @@ from prody.ensemble import Ensemble
 from prody.measure import calcCenter, calcTransformation, calcDistance, calcRMSD, superpose
 
 
-__all__ = ['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames', 
+__all__ =['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames', 
            'getChannelParameters', 'getChannelAtoms', 'showChannels', 
            'showCavities', 'showSurfaceCavities', 'selectChannelBySelection', 
            'getChannelResidueNames',
@@ -40,21 +40,6 @@ __all__ = ['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames',
            'getLinkParametersMultipleFrames', 'getLinkResidueNamesMultipleFrames',
            'scanSurfaceCavityParameters',
            'calcFrequentObjectResidues', 'showFrequentObjectResidues']
-
-# Sampling of the enclosure test used to strip the moat (see
-# ChannelCalculator.calcEnclosure). These are constants, not knobs: the enclosure
-# of a point depends on how many directions are sampled and how far they are
-# followed, so min_enclosure is only meaningful against a fixed sampling. Adding
-# rays lowers every enclosure, since more directions find more of the thin ways
-# out of a channel, and so invalidates the threshold rather than refining it.
-ENCLOSURE_RAYS = 32
-ENCLOSURE_RANGE = 25.0
-ENCLOSURE_STEP = 0.75
-# One radius for every atom, on the scale of a heavy-atom vdW radius. Enclosure is
-# a burial heuristic, so resolving 1.52 A from 1.7 A would only shift every value
-# by a little and be absorbed by min_enclosure; a single radius means a single
-# tree and a plain nearest-neighbour test.
-ENCLOSURE_RADIUS = 1.7
 
 # Van der Waals radii in Angstrom, by element symbol (upper case). The radii the
 # tessellation is built on, and the ones the lining report measures a Voronoi
@@ -1460,7 +1445,8 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         wide, low-cost routes along the outside of the protein. Erosion continues
         while the tetrahedra at the front are *open*, meaning that fewer than
         ``min_enclosure`` of the directions leaving them run into protein within
-        :data:`ENCLOSURE_RANGE` Angstrom, and halts at the first buried layer.
+        the reach of :meth:`.ChannelCalculator.calcEnclosure`, and halts at the
+        first buried layer.
 
         Bounding the erosion by size instead does not work. A count of tetrahedron
         layers is not mesh-invariant, as a layer is one tetrahedron thick and
@@ -1510,33 +1496,6 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         straight-chord integral cannot price). The reported bottleneck radius is
         unaffected by this choice.
     :type edge_cost: str or None
-
-    :arg exit_at_first_opening: Whether a channel must leave through the surface
-        opening it first reaches. Default is True.
-
-        The mouths are a layer one tetrahedron thick, so dropping their outgoing
-        edges does not by itself stop a route walking *around* a mouth through
-        the shell behind it and surfacing several Angstrom away; measured on 16
-        of 139 channels over a set of eight structures, one tunnel reported as
-        two. With this on, an opening is a mouth's inscribed ball rather than the
-        single tetrahedron at its centre, and a route that enters one has reached
-        the surface there, whatever tetrahedron it happens to stand in. Routes
-        are compared at that arrival, on their interior corridors, before they
-        fan out across the mouth; the survivors then leave by the cheapest mouth
-        of that same opening, and are compared once more at their exits, where
-        ``sparsity`` and ``similarity`` apply as they always have.
-
-        The reported route is the seed's own cheapest path to that exit, so a
-        channel is a genuine Dijkstra route and not two half-routes joined at the
-        arrival. A seed that lies inside an opening itself - a wide mouth's ball
-        reaches inward as well as outward - is not held to have arrived there,
-        or nothing downstream of it could arrive anywhere; the way straight out
-        through such an opening is reported as a channel of its own.
-
-        Set it False to restore the older behaviour, where every reachable mouth
-        yields a candidate and the openings are separated afterwards by
-        ``sparsity`` alone.
-    :type exit_at_first_opening: bool
 
     :returns: A tuple containing two elements:
         - `channels`: A list of detected channels, where each channel is an 
@@ -1592,7 +1551,6 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         'min_enclosure': 0.70,
         'max_peel_depth': None,
         'edge_cost': None,
-        'exit_at_first_opening': True,
         'weighted_cache': True,
         'weighted_mouth_depth': 2.5,
         'min_tetrahedra': None, 
@@ -1620,7 +1578,6 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     min_enclosure = options['min_enclosure']
     max_peel_depth = options['max_peel_depth']
     edge_cost = options['edge_cost']
-    exit_at_first_opening = options['exit_at_first_opening']
     weighted_cache = options['weighted_cache']
     weighted_mouth_depth = options['weighted_mouth_depth']
     min_tetrahedra = options['min_tetrahedra']
@@ -1692,8 +1649,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     atoms = atoms.select('not water') # water is excluded from the selection
     calculator = ChannelCalculator(atoms, inner_radius=inner_radius, sparsity=sparsity,
                                    route_tolerance=route_tolerance,
-                                   edge_cost=edge_cost,
-                                   exit_at_first_opening=exit_at_first_opening)
+                                   edge_cost=edge_cost)
 
     elements = np.char.upper(np.asarray(atoms.getElements(), dtype=str))
     has_hydrogens = bool(np.any(elements == 'H'))
@@ -5649,7 +5605,7 @@ class ChannelCalculator:
     CAVITY_MARKER_RADIUS = 1.00
 
     def __init__(self, atoms, inner_radius=1.2, sparsity=6, route_tolerance=2.0,
-                 edge_cost='integral', exit_at_first_opening=False):
+                 edge_cost='integral'):
         # Only the parameters the class actually consults are held here. surf_radius,
         # min_depth and bottleneck are stages of the pipeline, applied to the
         # tessellation and to the finished channels by calcChannels; keeping copies
@@ -5663,10 +5619,6 @@ class ChannelCalculator:
         # the Dijkstra edge weight in buildSparseGraph. Resolved per diagram by
         # calcChannels (weighted defaults to 'bottleneck').
         self.edge_cost = edge_cost
-        # Experimental. When True, a route is terminated at the opening it first
-        # reaches instead of at every mouth it can walk to: see the two-phase
-        # search in dijkstra. Off by default, so the search is unchanged.
-        self.exit_at_first_opening = exit_at_first_opening
         # Filled once by buildSparseGraph and read by the channel geometry:
         # the per-simplex Voronoi-vertex clearance (the spline knots) and the
         # per-edge gate clearance on each shared Delaunay face (the reported
@@ -5674,6 +5626,9 @@ class ChannelCalculator:
         # share one definition of width instead of recomputing it apart.
         self._vertex_clearance = None
         self._edge_bottleneck = None
+        # The real atoms and a tree over them, built by _enclosureAtoms only
+        # when an exchange of exits has to be judged.
+        self._enclosure_atoms = None
 
     def sphereFit(self, points, simplices, vertices, vdw_radii, r, rows=None):
         """Sum-based clearance test: for each tetrahedron, decide whether a probe
@@ -5803,9 +5758,10 @@ class ChannelCalculator:
 
         return simp, neigh, verti
 
-    def calcEnclosure(self, query, centers, tree=None):
+    def calcEnclosure(self, query, centers, tree=None, reach=25.0, rays=32,
+                      step=0.75, radius=1.7):
         """Fraction of the directions seen from each point of ``query`` that are
-        blocked by an atom within :data:`ENCLOSURE_RANGE` Angstrom.
+        blocked by an atom within ``reach`` Angstrom.
 
         A local, probe-independent measure of burial: a point in the open solvent
         sees sky in most directions, a point inside a channel is surrounded
@@ -5814,32 +5770,38 @@ class ChannelCalculator:
         Rays are marched outwards and a ray is dropped as soon as it is blocked,
         which is what keeps this affordable: in a buried region most directions
         hit protein within the first few Angstrom, and only the few that escape
-        are followed the whole way out. Marching costs
-        ``ENCLOSURE_RAYS x steps`` tree queries per point and so is all but
-        insensitive to how many atoms there are, whereas testing every atom in
-        range against every ray costs a multiple of the atom count, and with rays
-        this sparse nearly all of that work is wasted on atoms that lie near no
-        ray at all.
+        are followed the whole way out. Marching costs ``rays x steps`` tree
+        queries per point and so is all but insensitive to how many atoms there
+        are, whereas testing every atom in range against every ray costs a
+        multiple of the atom count, and with rays this sparse nearly all of that
+        work is wasted on atoms that lie near no ray at all.
 
         Pass the real atoms here, not the balls of a homogenized diagram: burial
         is a property of the protein, not of the tessellation. Atoms are all given
-        the same :data:`ENCLOSURE_RADIUS`, so one tree and one plain
-        nearest-neighbour test suffice. This is a burial heuristic and not a
-        surface calculation, and the alternative -- a per-atom radius, which no
-        nearest-neighbour query can express -- buys nothing that
-        ``min_enclosure`` cannot absorb.
+        the same ``radius``, so one tree and one plain nearest-neighbour test
+        suffice. This is a burial heuristic and not a surface calculation, and the
+        alternative -- a per-atom radius, which no nearest-neighbour query can
+        express -- buys nothing that ``min_enclosure`` cannot absorb.
 
-        :data:`ENCLOSURE_RAYS` is fixed rather than exposed, because it is part of
-        the definition of the quantity and not an accuracy knob. Adding rays is
-        not a free refinement: more directions discover more of the thin escape
-        routes out of a channel, so the enclosure of every point drifts downwards
-        and a threshold calibrated at one ray count does not carry over to
-        another.
+        The sampling is part of the definition of the quantity and not an accuracy
+        knob, which is why every caller that compares enclosures against a
+        threshold leaves it alone. Adding rays is not a free refinement: more
+        directions discover more of the thin escape routes out of a channel, so
+        the enclosure of every point drifts downwards and a threshold calibrated
+        at one ray count does not carry over to another.
 
         :arg query: points to evaluate, ``(n, 3)``.
         :arg centers: atom centres.
         :arg tree: optional prebuilt :class:`~scipy.spatial.cKDTree` over
             ``centers``, to avoid rebuilding it on every call.
+        :arg reach: how far a ray is followed before the direction counts as
+            open, in Angstrom. The default asks whether a point is inside the
+            protein at all; a few Angstrom asks the much more local question of
+            whether it sits in a niche.
+        :arg rays: how many directions are sampled.
+        :arg step: spacing of the samples along a ray, in Angstrom.
+        :arg radius: one radius for every atom, on the scale of a heavy-atom vdW
+            radius.
         :returns: ``n`` fractions in ``[0, 1]``."""
         query = np.asarray(query, dtype=float)
         if len(query) == 0:
@@ -5847,23 +5809,22 @@ class ChannelCalculator:
         if tree is None:
             tree = _kdTree(centers)
 
-        i = np.arange(ENCLOSURE_RAYS) + 0.5
-        phi = np.arccos(1 - 2 * i / ENCLOSURE_RAYS)
+        i = np.arange(rays) + 0.5
+        phi = np.arccos(1 - 2 * i / rays)
         theta = np.pi * (1 + 5 ** 0.5) * i              # Fibonacci sphere
         directions = np.stack([np.sin(phi) * np.cos(theta),
                                np.sin(phi) * np.sin(theta),
                                np.cos(phi)], axis=1)
 
-        blocked = np.zeros((len(query), ENCLOSURE_RAYS), dtype=bool)
+        blocked = np.zeros((len(query), rays), dtype=bool)
         live = np.ones_like(blocked)
-        for step in np.arange(ENCLOSURE_STEP,
-                              ENCLOSURE_RANGE + ENCLOSURE_STEP, ENCLOSURE_STEP):
+        for distance in np.arange(step, reach + step, step):
             point, ray = np.nonzero(live)
             if not len(point):
                 break
-            samples = query[point] + directions[ray] * step
-            hit = tree.query(samples, distance_upper_bound=ENCLOSURE_RADIUS,
-                             workers=-1)[0] <= ENCLOSURE_RADIUS
+            samples = query[point] + directions[ray] * distance
+            hit = tree.query(samples, distance_upper_bound=radius,
+                             workers=-1)[0] <= radius
             blocked[point[hit], ray[hit]] = True
             live[point[hit], ray[hit]] = False
 
@@ -6732,11 +6693,11 @@ class ChannelCalculator:
             # not itself in the second layer and so still conducting - and
             # surface again somewhere else. That leak is real but narrow (the
             # twins sit 0.1-0.7 A from a mouth, in the surface shell at depth
-            # 1-4), and such a path always passes through the exit sphere of a
-            # channel that is already reported. It is therefore handled in
-            # _addDedupedChannels, which cuts a path at the first reported exit
-            # sphere it enters - the point where it truly leaves the protein -
-            # rather than walling the graph off against every mouth.
+            # 1-4). It is closed downstream rather than by walling the graph off
+            # against every mouth: a route is judged to have reached the surface
+            # when it enters a mouth's inscribed *ball*, so slipping past the
+            # tetrahedron does not slip past the opening. See the arrival test
+            # below.
             absorbing = [global_to_local[int(t)]
                          for t, c in zip(exit_tetra, clearance)
                          if c >= self.inner_radius and int(t) in global_to_local
@@ -6757,17 +6718,20 @@ class ChannelCalculator:
             # one opening. See the comment at the target loop below.
             terminals_local = absorbing
 
-        # exit_at_first_opening: the mouth layer is one tetrahedron thick, so
-        # zeroing its outgoing edges does not actually stop a route from walking
-        # *around* a mouth through the shell behind it and surfacing elsewhere -
-        # measured on 16 of 139 channels over a set of eight structures. An
-        # opening is therefore taken to be a mouth's inscribed ball rather than
-        # the single tetrahedron at its centre: a route that enters one has
-        # reached the surface there, whatever tetrahedron it happens to stand in.
+        # The mouth layer is one tetrahedron thick, so zeroing its outgoing edges
+        # does not actually stop a route from walking *around* a mouth through
+        # the shell behind it and surfacing elsewhere - measured on 16 of 139
+        # channels over a set of eight structures. An opening is therefore taken
+        # to be a mouth's inscribed ball rather than the single tetrahedron at
+        # its centre: a route that enters one has reached the surface there,
+        # whatever tetrahedron it happens to stand in.
         opening_tree = None
         opening_count = None
-        two_phase = bool(self.exit_at_first_opening and terminals_local)
-        if two_phase:
+        # A cavity with no mouth at all reports no channel, and the machinery
+        # below has nothing to build its trees from, so everything it guards is
+        # skipped rather than run on empty arrays.
+        has_mouths = bool(terminals_local)
+        if has_mouths:
             mouth_local = np.asarray(terminals_local, dtype=np.intp)
             mouth_xyz = vertices[cavity_tetra[mouth_local]]
             mouth_radius = np.asarray(absorbing_radius, dtype=float)
@@ -6806,9 +6770,7 @@ class ChannelCalculator:
             covers = np.linalg.norm(centres[near] - here, axis=1) < radii[near]
             return frozenset(int(k) for k in near[covers])
 
-        candidates = []
-        # (path_local, cost, arrival_local, opening, seed_index) for
-        # exit_at_first_opening.
+        # (path_local, cost, arrival_local, opening, seed_index) per arrival.
         opening_candidates = []
         # Per seed, (start_local, distances, predecessors) of its search, so that
         # _addOpeningChannels can read off the seed's own path to whichever mouth
@@ -6844,9 +6806,9 @@ class ChannelCalculator:
             # through them is still a channel - the shortest one there is - so
             # the seed is emitted as an arrival in its own right below and phase
             # two walks it to the cheapest of those mouths.
-            seed_openings = mouthsAt(start_local) if two_phase else frozenset()
+            seed_openings = mouthsAt(start_local) if has_mouths else frozenset()
             inside_opening = None
-            if two_phase:
+            if has_mouths:
                 if seed_openings:
                     own = np.zeros_like(opening_count)
                     for k in seed_openings:
@@ -6905,84 +6867,46 @@ class ChannelCalculator:
             while stack:
                 node, path, arrived = stack.pop()
                 paths[node] = path
-                if two_phase and not arrived and inside_opening[node]:
+                if has_mouths and not arrived and inside_opening[node]:
                     arrivals.append(node)
                     arrived = True
                 for child in parent_to_children.get(node, []):
                     stack.append((child, path + [child], arrived))
 
-            # A channel ends where it first touches the surface, i.e. at whichever
-            # mouth absorbed it - so emit a candidate for every *reachable* mouth,
-            # not for a pre-sampled subset of them. Sampling the targets before the
-            # search (as an earlier version did, thinning the mouths by `sparsity`
-            # first) can pick a target that sits behind another mouth: the path is
-            # absorbed at that nearer mouth and can go no further, the sampled
-            # target is never
-            # reached, and because only sampled targets emit channels the tunnel is
-            # reported nowhere at all. Which mouth happens to shadow which target is
-            # a tessellation accident, so real tunnels vanished at some meshes and
-            # not others. Every mouth is a legitimate terminus, so let every
-            # reachable one produce a candidate and leave exit identity to the
+            # One candidate per *arrival*: the node where a route first enters an
+            # opening, collected during the walk above so that each branch
+            # contributes exactly one. The seed leads the list when it sits in an
+            # opening of its own, standing in for the way straight out through it;
+            # its route is the single node, and phase two supplies the whole of
+            # the path.
+            #
+            # Note what is NOT done here: thinning the mouths by `sparsity` before
+            # the search, as an earlier version did. That can pick a target
+            # sitting behind another mouth - the path is absorbed at the nearer
+            # one and never reaches the sampled target, so the tunnel is reported
+            # nowhere at all. Which mouth shadows which is a tessellation
+            # accident, so real tunnels vanished at some meshes and not others.
+            # Every mouth is a legitimate terminus; exit identity is left to the
             # dedup, where `sparsity` merges the mouths that share one opening.
-            if two_phase:
-                # One candidate per *arrival*: the node where a route first
-                # enters an opening, collected during the walk above so that each
-                # branch contributes exactly one. The seed leads the list when it
-                # sits in an opening of its own, standing in for the way straight
-                # out through it; its route is the single node, and phase two
-                # supplies the whole of the path.
-                for arrival in ([start_local] if seed_openings else []) + arrivals:
-                    arrival = int(arrival)
-                    path_local = paths.get(arrival)
-                    if path_local is None:
-                        continue
-                    if chamber_labels is not None:
-                        joined_at, _ = firstForeignChamber(path_local)
-                        if joined_at is not None:
-                            continue
-                    # The seed's own openings are the seed's business alone: for
-                    # any other arrival they are behind it, and letting one serve
-                    # as the exit would send phase two back the way it came.
-                    opening = (seed_openings if arrival == start_local
-                               else mouthsAt(arrival) - seed_openings)
-                    if not opening:
-                        continue
-                    opening_candidates.append((path_local,
-                                               float(distances[arrival]),
-                                               arrival, opening, seed_index))
-
-            # In two-phase mode the arrivals above are the candidates; the
-            # per-mouth loop is skipped, but the links below still run.
-            for exit_local in ([] if two_phase else terminals_local):
-                if exit_local == start_local:
-                    continue
-                if np.isinf(distances[exit_local]):
-                    continue
-
-                path_local = paths.get(exit_local)
+            for arrival in ([start_local] if seed_openings else []) + arrivals:
+                arrival = int(arrival)
+                path_local = paths.get(arrival)
                 if path_local is None:
                     continue
-
-                # A route that joins another chamber on its way out is not this
-                # chamber's channel: it is a link to that chamber followed by that
-                # chamber's own channel, and both halves are reported separately.
-                # Emitting it whole is what leaves long, narrow duplicates that
-                # run through one pocket to surface at another's mouth. The exit
-                # is not lost by dropping it - the chamber the route joined
-                # searches the same mouth from much closer.
                 if chamber_labels is not None:
                     joined_at, _ = firstForeignChamber(path_local)
                     if joined_at is not None:
                         continue
-
-                path_global = cavity_tetra[path_local]
-                channel = Channel(path_global, *self.processChannel(
-                    path_global, vertices, points, vdw_radii, simplices),
-                    cost=float(distances[path_local[-1]]))
-                # the Dijkstra cost at every node, so that a path cut short at a
-                # reported exit can be re-costed at the node it was cut at
-                node_costs = np.asarray(distances)[np.asarray(path_local)]
-                candidates.append((channel, node_costs))
+                # The seed's own openings are the seed's business alone: for any
+                # other arrival they are behind it, and letting one serve as the
+                # exit would send phase two back the way it came.
+                opening = (seed_openings if arrival == start_local
+                           else mouthsAt(arrival) - seed_openings)
+                if not opening:
+                    continue
+                opening_candidates.append((path_local,
+                                           float(distances[arrival]),
+                                           arrival, opening, seed_index))
 
             # One link per other seed reachable from this one, cut at the first
             # chamber the route joins. The cut chamber need not be the chamber of
@@ -7028,16 +6952,134 @@ class ChannelCalculator:
 
         # Channels first: a link is judged against the openings they report, so
         # they have to exist by the time the links are deduped.
-        if two_phase:
+        openings = np.empty((0, 3)), np.empty(0)
+        if has_mouths:
             openings = self._addOpeningChannels(
                 cavity, opening_candidates, similarity, transit_graph,
                 cavity_tetra, vertices, points, vdw_radii, simplices,
                 mouth_local, mouth_xyz, mouth_radius, seed_trees)
-        else:
-            openings = self._addDedupedChannels(cavity, candidates, similarity,
-                                                vertices, points, vdw_radii,
-                                                simplices)
         self._addDedupedLinks(cavity, link_candidates, similarity, openings)
+
+    def _exitImproves(self, home, candidate, seed_trees):
+        """Is ``candidate`` a better way out than the ``home`` already reported?
+
+        Both are routes the corridor test has already called one channel, so this
+        is not asking which corridor to keep but which of two endings to show for
+        it. Calibrated against channels judged by eye over a corpus of twenty
+        structures: of the exchanges a bare "is the mouth wider" rule made, fewer
+        than half were improvements, and the tests below are what the other half
+        turned out to have in common.
+
+        An exchange has to be an improvement in one of two ways, and may not be a
+        regression in either.
+
+        *Enabler: a wider mouth.* By at least ``min_gain``, because clearances a
+        few hundredths apart are one hole sampled by two tetrahedra and buying
+        that costs a longer route for nothing. The worthwhile exchanges widen the
+        exit by 0.2 to 1.9 Angstrom and the worthless ones by 0.01 to 0.04.
+
+        *Enabler: a wider bottleneck.* The channel's own headline number, which a
+        mouth width can move without touching. It matters on exactly the channels
+        whose bottleneck *is* their exit - there, widening the mouth widens the
+        channel, and holding those to the mouth threshold would refuse a real
+        improvement over a few hundredths of an Angstrom.
+
+        *Guard: neither may go backwards.* An exchange may not narrow the mouth to
+        widen the bottleneck, nor narrow the bottleneck to widen the mouth. The
+        second is the one that bites: the two routes are identical up to their
+        fork, so a candidate whose bottleneck is lower must be pinching within the
+        stretch it adds - it is reaching a better exit by threading a tighter gap
+        than anything on the route it replaces.
+
+        *Not much dearer, measured on the tails.* Only what follows the fork is
+        being chosen; the shared head is common to both by construction. Charging
+        the difference against the whole cost makes the verdict depend on how much
+        identical prefix happens to precede the fork - the same decision read as
+        +0.9% on a long channel and +11.4% on a short one, and refused the short
+        one. On tails the same three decisions read +24%, +21% and +26%. The head
+        is discounted only when both routes come from one seed's tree and so
+        really do share it; otherwise the whole cost is compared, as before.
+
+        *Not the same ending continued.* Both routes are paths in one Dijkstra
+        tree, so they share a prefix and part at a fork. When the fork is at the
+        last node or two the candidate does not go anywhere else, it carries on
+        past the reported mouth and surfaces a little further out - which is the
+        thing ending a channel at its first opening exists to prevent, and is
+        refused on that ground rather than on any measurement.
+
+        *No more buried than what it replaces.* This is the test that catches what
+        clearance cannot. A wider mouth can sit deeper in a groove than the
+        narrower one beside it, and then the channel gains a number and loses its
+        ending: measured, exchanges that widened the exit by 0.24 to 0.52 Angstrom
+        while burying it were exactly the ones that looked wrong. Burial is read
+        at two scales because neither works alone - inside a wide lumen the closer
+        scale saturates near zero and stops discriminating, while the further one
+        misses a mouth that is pinched only locally. A tolerance of one ray keeps
+        the sampling's own quantum from reading as a change."""
+        # Least widening of the mouth, in Angstrom, that enables an exchange on
+        # its own. The exchanges worth making widen the exit by 0.2 to 1.9 and
+        # the worthless ones by 0.01 to 0.04; 0.15 sits clear of the nearest
+        # candidates on either side of it in that corpus, 0.09 and 0.18.
+        min_gain = 0.15
+        # How much dearer the candidate's tail may be than the tail it replaces.
+        # Not a knife-edge: nothing in the corpus falls between 27% and 62%, so
+        # anywhere in that range gives identical results.
+        max_tail_cost = 0.30
+        scales = (6.0, 8.0)          # Angstrom; see the paragraph on burial above
+        # How much of its own path a candidate must give up to be going somewhere
+        # else. The measured gap is wide: continuations give up 0.2 Angstrom, the
+        # next-shallowest genuine alternative 1.2.
+        min_fork = 1.0
+        rays = 32
+        eps = 1e-9
+
+        if (candidate['clear'] < home['clear'] - eps
+                or candidate['bottleneck'] < home['bottleneck'] - eps):
+            return False
+        if not (candidate['clear'] >= home['clear'] + min_gain
+                or candidate['bottleneck'] > home['bottleneck'] + eps):
+            return False
+
+        kept, offered = home['path'], candidate['path']
+        shared = 0
+        while (shared < min(len(kept), len(offered))
+               and kept[shared] == offered[shared]):
+            shared += 1
+        fork = max(shared - 1, 0)
+
+        forsaken = home['route'][fork:]
+        if len(forsaken) < 2 or np.linalg.norm(
+                np.diff(forsaken, axis=0), axis=1).sum() < min_fork:
+            return False
+
+        head = 0.0
+        if (shared and home['seed'] == candidate['seed']
+                and home['from_tree'] and candidate['from_tree']):
+            head = float(seed_trees[home['seed']][1][kept[fork]])
+        if not (0.0 <= head < home['cost']):
+            head = 0.0               # a spliced route, or a degenerate prefix
+        if (candidate['cost'] - head > (home['cost'] - head)
+                * (1.0 + max_tail_cost)):
+            return False
+
+        coords, tree = self._enclosureAtoms()
+        pair = np.vstack((home['xyz'], candidate['xyz']))
+        for reach in scales:
+            here, there = self.calcEnclosure(pair, coords, tree=tree,
+                                             reach=reach, rays=rays)
+            if there > here + 1.0 / rays:
+                return False
+        return True
+
+    def _enclosureAtoms(self):
+        """The real atoms and a tree over them, built once and only if asked for.
+
+        Burial is a property of the protein, so this is the structure itself and
+        not the balls the tessellation was built on, which may be homogenized."""
+        if self._enclosure_atoms is None:
+            coords = getCoords(self.atoms)
+            self._enclosure_atoms = (coords, _kdTree(coords))
+        return self._enclosure_atoms
 
     def _addOpeningChannels(self, cavity, candidates, similarity, cavity_graph,
                             cavity_tetra, vertices, points, vdw_radii, simplices,
@@ -7130,8 +7172,8 @@ class ChannelCalculator:
 
         centres = np.empty((0, 3))
         radii = np.empty(0)
-        extended = []               # (cost, channel, route, exit_xyz, exit_r)
-        reported = []               # (route, exit_xyz, exit_r) of what is kept
+        extended = []               # (cost, channel, route, xyz, radius, clear)
+        reported = []               # one dict per channel kept, see below
         if not kept:
             return centres, radii
 
@@ -7152,6 +7194,10 @@ class ChannelCalculator:
                          if np.isfinite(distances[i][mouth_local[k]])]
             path_full = np.asarray(path_local, dtype=np.intp)
             exit_k = None
+            # Whether the reported route is the seed's own tree path. Only then
+            # do two routes of one seed share a prefix whose cost is the same for
+            # both, which is what _exitImproves discounts before comparing them.
+            from_tree = False
             if reachable:
                 # The route reported is the SEED's own path to the mouth, not
                 # seed->arrival spliced onto a fresh arrival->mouth search. Each
@@ -7192,6 +7238,7 @@ class ChannelCalculator:
                 if route_local:
                     path_full = np.asarray(route_local, dtype=np.intp)
                     cost = float(seed_distances[int(mouth_local[exit_k])])
+                    from_tree = True
                 else:
                     # Either the seed's search never reached a mouth of this
                     # opening (all of them absorbed behind another), or its path
@@ -7224,8 +7271,16 @@ class ChannelCalculator:
             exit_xyz = vertices[path_global[-1]]
             exit_radius = max(float(mouth_radius[exit_k]), self.sparsity / 2.0) \
                 if exit_k is not None else self.sparsity / 2.0
-            extended.append((float(cost), channel, vertices[path_global],
-                             exit_xyz, exit_radius))
+            # The mouth's own clearance as well as the sphere it registers: the
+            # sphere carries the sparsity floor, so it cannot say which of two
+            # exits is the wider hole.
+            exit_clear = float(mouth_radius[exit_k]) if exit_k is not None \
+                else 0.0
+            extended.append(dict(
+                cost=float(cost), channel=channel, route=vertices[path_global],
+                xyz=exit_xyz, radius=exit_radius, clear=exit_clear,
+                bottleneck=float(channel.bottleneck), path=path_full,
+                seed=seed, from_tree=from_tree))
 
         # Second pass, on the finished channels: the arrival test above settles
         # only whether two routes came out of the *same* opening, which is a much
@@ -7234,11 +7289,18 @@ class ChannelCalculator:
         # `sparsity` may well call their openings one. So the ordinary
         # opening-and-corridor identity still runs, now on exits that are
         # guaranteed to lie in the opening the route actually reached.
-        for cost, channel, route, exit_xyz, exit_radius in sorted(
-                extended, key=lambda c: c[0]):
-            duplicate = False
-            for kept_route, kept_xyz, kept_radius in reported:
-                if np.linalg.norm(exit_xyz - kept_xyz) >= kept_radius + exit_radius:
+        # A duplicate is not simply dropped: if _exitImproves finds it a better
+        # way out, it becomes the one reported. Two routes that the corridor test
+        # calls the same channel can still end at very different mouths -
+        # measured 2.30 A against 4.16 A on a 0.9% cost difference - and cost,
+        # which is dominated by the interior, is close to blind to the difference.
+        for offer in sorted(extended, key=lambda c: c['cost']):
+            route, exit_xyz = offer['route'], offer['xyz']
+            home = None
+            for entry in reported:
+                kept_xyz, kept_radius = entry['xyz'], entry['radius']
+                if np.linalg.norm(exit_xyz - kept_xyz) >= (kept_radius
+                                                           + offer['radius']):
                     continue
                 # No opening discount, unlike the one-pass dedup. That discount
                 # exists to stop the fan two routes make as they splay across a
@@ -7247,14 +7309,26 @@ class ChannelCalculator:
                 # compared before they reached a mouth at all. Applying it again
                 # here would discount the very stretch that tells apart two
                 # corridors arriving at neighbouring openings.
-                if self._routeCoverage(route, kept_route) >= similarity:
-                    duplicate = True
+                if self._routeCoverage(route, entry['route']) >= similarity:
+                    home = entry
                     break
-            if not duplicate:
-                reported.append((route, exit_xyz, exit_radius))
-                cavity.addChannel(channel)
-                centres = np.vstack((centres, exit_xyz))
-                radii = np.append(radii, exit_radius)
+            if home is None:
+                reported.append(offer)
+            elif self._exitImproves(home, offer, seed_trees):
+                founding_cost = home['cost']
+                home.update(offer)
+                # The founder's cost stays, so every later candidate is judged
+                # against the cheapest route into this opening and the tolerance
+                # cannot ratchet upwards through a chain of exchanges.
+                home['cost'] = founding_cost
+
+        # Added only now, so that an exchange replaces a representative rather
+        # than leaving the superseded channel in the cavity. The list is still in
+        # cost order, which is the order the channels are numbered in.
+        for entry in reported:
+            cavity.addChannel(entry['channel'])
+            centres = np.vstack((centres, entry['xyz']))
+            radii = np.append(radii, entry['radius'])
         return centres, radii
 
     def _tracePath(self, predecessors, source, target):
@@ -7279,10 +7353,10 @@ class ChannelCalculator:
         first, and each candidate judged only against what is already kept, so
         the result does not depend on the order the seeds were searched in.
 
-        A link that runs through a reported opening is dropped first. That is the
-        same test :meth:`_addDedupedChannels` makes in its step 1 - a route
-        passing through the exit sphere of a reported channel has left the
-        protein there - and links were the one object never held to it, the
+        A link that runs through a reported opening is dropped first, on the same
+        ground the channels themselves are held to - a route passing through the
+        exit sphere of a reported channel has left the protein there - and links
+        were the one object never held to it, the
         chamber cut having been assumed to stop them soon enough. It does not: a
         route aimed at another seed has no reason to enter a mouth, so absorption
         never fires, and it steps around one through a neighbouring tetrahedron
@@ -7312,163 +7386,6 @@ class ChannelCalculator:
             if not duplicate:
                 kept.append((points_on_route, joined))
                 cavity.addLink(link)
-
-    def _addDedupedChannels(self, cavity, candidates, similarity, vertices,
-                            points, vdw_radii, simplices):
-        # Cheapest first, and each candidate is judged only against the channels
-        # already kept - so the kept channel is always the cheapest of its group
-        # and the result does not depend on the order candidates arrive in.
-        #
-        # Step 1, CUT. A reported channel's exit sphere (centred on its exit
-        # vertex, radius the clearance there) is the volume of that opening. If a
-        # candidate's route passes through it, the candidate has left the protein
-        # at that opening: whatever it does afterwards is a hop across the outside,
-        # not part of a tunnel. So cut it there. This is what stops a path from
-        # slipping past a mouth through a twin tetrahedron and claiming some far
-        # exit on the other side. Note the cut is made only against the handful of
-        # *already reported* exits, never against all mouths - truncating against
-        # every mouth is what used to demolish real tunnels.
-        #
-        # Step 2, COMPARE. Two channels are the same tunnel when they leave by the
-        # same opening AND take the same corridor to get there. Both halves are
-        # needed: a corridor that forks near the surface and exits twice through
-        # one opening is one tunnel counted twice (merge), but two genuinely
-        # different corridors that happen to surface at the same opening are two
-        # tunnels (keep), and one corridor reaching two separate openings is also
-        # two tunnels (keep). A candidate that was cut in step 1 is compared on its
-        # cut route, which is the only part of it that is really a tunnel.
-        #
-        # Route identity is measured GEOMETRICALLY - how much of one centerline
-        # runs alongside the other - not as a shared prefix of tetrahedra. A prefix
-        # is the wrong instrument twice over: it is blind to rejoining (two routes
-        # that split near the seed and then run together to the same exit share
-        # almost no prefix, yet are plainly one tunnel) and it is fooled by
-        # containment (a short route that is a prefix of a long one scores ~1.0 and
-        # deletes the long one, which is the channel carrying the distinctive
-        # route). Comparing the curves is immune to both, and to the tessellation:
-        # a tetrahedron count is not mesh-invariant, so the same physical fork
-        # scores differently at different max_deviation.
-        prepared = sorted(candidates, key=lambda c: c[0].cost)
-        if not prepared:
-            return np.empty((0, 3)), np.empty(0)
-
-        kept = []  # (channel, pts, exit_xyz, opening_radius)
-        # The opening centres and radii of `kept`, carried as arrays so that step
-        # 1 can test a candidate against every reported opening at once. Grown on
-        # append instead of rebuilt per candidate: `kept` gains at most one entry
-        # per candidate, so rebuilding would put an O(len(kept)) Python pass back
-        # into the hot loop and cost more than it saves on a small `kept`.
-        centres = np.empty((0, 3))
-        radii = np.empty(0)
-        for channel, node_costs in prepared:
-            tetra = np.asarray(channel.tetrahedra)
-            pts = vertices[tetra]
-
-            # step 1: cut at the first reported opening this route enters.
-            # One (nodes x openings) distance test instead of the former Python
-            # double loop: np.argmax over the boolean rows returns the first
-            # True, so the node picked is the first one inside any opening and
-            # the cutter is the first opening in `kept` order that contains it -
-            # the same two `break`s the loop used to take. Multi-seeding pools
-            # every seed's candidates into this one pass, and the loop was its
-            # cost centre (measured 238s versus 6s single-seed on 1tqn).
-            cut, cutter = None, None
-            if kept:
-                inside = np.linalg.norm(pts[1:, None, :] - centres,
-                                        axis=2) < radii
-                entered = inside.any(axis=1)
-                if entered.any():
-                    row = int(np.argmax(entered))
-                    cut = row + 1
-                    cutter = kept[int(np.argmax(inside[row]))]
-            if cut is not None:
-                tetra = tetra[:cut + 1]
-                pts = pts[:cut + 1]
-                channel = Channel(tetra, *self.processChannel(
-                    tetra, vertices, points, vdw_radii, simplices),
-                    cost=float(node_costs[cut]))
-
-            # step 2: same opening AND same corridor -> the same tunnel.
-            # The corridor is compared OUTSIDE the shared opening. Inside it the
-            # routes are already through the mouth and merely fanning out across
-            # it, and that fan is not evidence of a different corridor: the
-            # Voronoi network splays where a tunnel widens into its opening, so
-            # sibling paths peel off in the last few Angstrom and end on
-            # neighbouring exit tetrahedra. Counting that splay as divergence is
-            # what used to report one tunnel as a bundle of near-copies.
-            #
-            # The opening test is SYMMETRIC: two exits are one opening when
-            # their mouth spheres overlap, not when one centre falls inside the
-            # other's sphere. A one-sided test is measuring the wrong thing -
-            # it asks whether a sibling exit lands in the middle of the kept
-            # mouth, whereas the question is whether the two mouths are the same
-            # hole. Sibling exits land on neighbouring tetrahedra all around one
-            # opening, so they sit roughly a mouth radius apart, and the
-            # one-sided test then answers "different opening" for a pair whose
-            # spheres overlap almost completely and whose corridors are
-            # identical. Because that test runs first, the corridor comparison
-            # never gets to speak: the pair is reported twice however tightly
-            # `similarity` is set.
-            # `sparsity` is a centre-to-centre DISTANCE between openings, so the
-            # floor it puts on a single opening radius is half of it: two exits
-            # whose clearances are both below the floor merge exactly when they
-            # are closer than `sparsity`, which is what the argument promises.
-            if cut is None:
-                own_radius = max(self.calculateMaxRadius(
-                    pts[-1], points, vdw_radii,
-                    simplices[tetra[-1]]), self.sparsity / 2.0)
-            else:
-                # A cut route ends at an interior tetrahedron that merely lies
-                # inside a reported exit volume (see the inheritance note
-                # below); its inscribed sphere is not a mouth, so it lends no
-                # radius of its own to the test. It needs none against the
-                # opening that cut it - it is inside that one by construction -
-                # and letting an interior sphere widen the test against every
-                # other opening is exactly the promotion the cut path is
-                # denied everywhere else.
-                own_radius = 0.0
-
-            duplicate = False
-            for _kc, kpts, kxyz, kr in kept:
-                if np.linalg.norm(pts[-1] - kxyz) >= kr + own_radius:
-                    continue                        # a different opening
-                if self._routeCoverage(pts, kpts, center=kxyz,
-                                       radius=kr) >= similarity:
-                    duplicate = True
-                    break
-            if not duplicate:
-                if cut is not None:
-                    # A cut channel stops inside an opening that is already
-                    # reported, so it INHERITS that opening rather than declaring
-                    # its own. Its last tetrahedron is an interior one that merely
-                    # happens to lie in the exit volume, and its inscribed sphere
-                    # is not a mouth - promoting it to a cutting surface would let
-                    # an interior sphere start truncating other candidates. (It
-                    # survives to here only when it reached that opening by a
-                    # genuinely different corridor, which is a distinct tunnel and
-                    # must be kept. Note its cost, taken at the cut node, is
-                    # necessarily below that of the channel that cut it, since the
-                    # cut lies upstream of that channel's mouth - so cost orders
-                    # the output but does not mean the cut channel is "better".)
-                    opening_xyz, opening_radius = cutter[2], cutter[3]
-                else:
-                    # One radius stands for this opening everywhere: it cuts routes
-                    # that pass through it, it decides which channels share it, and
-                    # it is the region discounted when their corridors are compared.
-                    # The clearance at the exit vertex measures the mouth, but on a
-                    # coarse tessellation it is erratic and can collapse to almost
-                    # nothing, fragmenting one physical mouth into several; the
-                    # `sparsity / 2` floor keeps it mesh-independent.
-                    opening_xyz = pts[-1]
-                    opening_radius = own_radius
-                kept.append((channel, pts, opening_xyz, opening_radius))
-                centres = np.vstack((centres, opening_xyz))
-                radii = np.append(radii, opening_radius)
-        for channel, _pts, _xyz, _r in kept:
-            cavity.addChannel(channel)
-        # The openings this cavity reports, handed on so that the links can be
-        # held to the same rule as the candidates were in step 1.
-        return centres, radii
 
     def _routeCoverage(self, a, b, tol=None, center=None, radius=0.0):
         """Fraction of the SHORTER centerline's arc length that runs within ``tol``
