@@ -2128,25 +2128,35 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
                 # in that line is the number of rows marked here by definition.
                 note = '  sealed'
                 sealed += 1
-            rows.append(['sp{0}'.format(index), where, '{0:.0f}'.format(volume),
+            # The seed's own Voronoi vertex, written so that it can be pasted back
+            # as start_point to search this one site again - the automatic passes
+            # otherwise report which void they started from but never where, and
+            # the placement cannot be reproduced or adjusted without it.
+            seed_vertex = vertices[seed_rows[index][2]]
+            rows.append(['sp{0}'.format(index),
+                         '[{0:.3f}, {1:.3f}, {2:.3f}]'.format(*seed_vertex),
+                         where, '{0:.0f}'.format(volume),
                          '{0:.1f}'.format(depth),
                          str(len(traced)) if traced else '-',
                          str(len(linked)) if linked else '-', note])
 
-        header = ['site', 'void', 'volume [Å³]', 'depth [Å]',
+        header = ['site', 'start_point [Å]', 'void', 'volume [Å³]', 'depth [Å]',
                   'channels', 'links']
 
         # A single search site names nothing with an sp<n> - every row would be
         # sp0, and nothing written carries the tag either - and it can hold no
         # link, which needs a second site to arrive at. Both columns are dropped
-        # there, leaving the one row to say what the void is and what came out
-        # of it. The notes are kept out of the widths, being ragged text at the
-        # end of the row rather than a column of it.
-        keep = range(len(header)) if name_sites else [1, 2, 3, 4]
+        # there, leaving the one row to say where the search began, what the void
+        # is and what came out of it. The notes are kept out of the widths, being
+        # ragged text at the end of the row rather than a column of it, so the
+        # coordinates sit ahead of them rather than being run into by an arrow.
+        keep = range(len(header)) if name_sites else [1, 2, 3, 4, 5]
         notes = [row[len(header)] for row in rows]
         rows = [[row[column] for column in keep] for row in rows]
         header = [header[column] for column in keep]
-        labels = 2 if name_sites else 1
+        # site, start_point and void are text and read left-aligned; the counts
+        # and measurements after them are compared down the page and go right.
+        labels = 3 if name_sites else 2
         widths = [max(len(row[column]) for row in [header] + rows)
                   for column in range(len(header))]
 
