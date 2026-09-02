@@ -5054,7 +5054,10 @@ def scanChannelParameters(atoms, inner_radius_values=(1.2, 1.4, 1.6),
                     channel.length, channel.bottleneck, channel.volume,
                     curvature, cost))
 
-    calcChannelSurfaceOverlaps(pqr_files=pqr_files, output_file_name=str(occupancy_file))
+    calcChannelSurfaceOverlaps(pqr_files=pqr_files,
+                               output_file_name=str(occupancy_file),
+                               resolution=resolution,
+                               max_proc=max_proc)
     LOGGER.report('Channel parameters scan completed in %.2fs.', '_prody_scanChannelParameters')
 
     return channels_all, parameter_sets, str(occupancy_file)
