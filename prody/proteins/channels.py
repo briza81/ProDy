@@ -18,7 +18,7 @@ from prody.atomic import Atomic
 from prody.utilities import getCoords, isListLike
 from prody.proteins import writePDB, parsePDB, parsePQR
 from prody.ensemble import Ensemble
-from prody.measure import calcCenter, calcTransformation, calcDistance, calcRMSD, superpose
+from prody.measure import calcCenter
 
 
 __all__ =['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames', 
@@ -7580,12 +7580,6 @@ class ChannelCalculator:
         volume = self.calculateChannelVolume(centerline_spline, radius_spline)
         
         return centerline_spline, radius_spline, length, bottleneck, volume
-
-    def findBiggestTetrahedron(self, tetrahedra, voronoi_vertices, points, 
-                               vdw_radii, simp):
-        radii = np.array([self.calculateMaxRadius(voronoi_vertices[tetra], points, vdw_radii, simp[tetra]) for tetra in tetrahedra])
-        max_radius_index = np.argmax(radii)
-        return tetrahedra[max_radius_index]
 
     def filterCavities(self, cavities, min_depth):
         return [cavity for cavity in cavities if cavity.depth >= min_depth]
