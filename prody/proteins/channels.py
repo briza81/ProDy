@@ -2738,12 +2738,16 @@ def connectChannelsToSurfaceCavities(channels, channel_details, cavities,
             if len(local_cavity_tetrahedra) == 0:
                 continue
 
-            connected.append({'cavity_index': cavity_index, 'channel_index': channel_index,
-                'cavity': cavity, 'channel': channel, 'trimmed_channel': trimmed_channel,
-                'cavity_tetrahedra': local_cavity_tetrahedra, 'connection_point': connection_point,
+            connected.append({'cavity_index': cavity_index, 
+                'channel_index': channel_index,
+                'cavity': cavity, 'channel': channel, 
+                'trimmed_channel': trimmed_channel,
+                'cavity_tetrahedra': local_cavity_tetrahedra, 
+                'connection_point': connection_point,
                 'minimum_distance': float(np.min(distances))})
 
-    LOGGER.info("Detected {0} connected surface cavity-channel pair(s).".format(len(connected)))
+    LOGGER.info(
+        "Detected {0} connected surface cavity-channel pair(s).".format(len(connected)))
 
     connected_cavities = set()
     connected_channels = set()
@@ -2767,8 +2771,11 @@ def connectChannelsToSurfaceCavities(channels, channel_details, cavities,
 
             LOGGER.info("    cavity {0} <-> {1}, minimum distance {2:.2f} A, "
                     "local cavity {3}/{4} tetrahedra".format(
-                    cavity_index, channel_label, result['minimum_distance'],
-                    len(result['cavity_tetrahedra']), len(result['cavity'].tetrahedra)))
+                    cavity_index, 
+                    channel_label, 
+                    result['minimum_distance'],
+                    len(result['cavity_tetrahedra']), 
+                    len(result['cavity'].tetrahedra)))
 
     unconnected_cavities = [i for i in range(len(cavities))
         if i not in connected_cavities]
