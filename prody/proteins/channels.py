@@ -2621,7 +2621,22 @@ def connectChannelsToSurfaceCavities(channels, channel_details, cavities,
     :type separate: bool
 
     :returns: Connected channel-cavity results.
-    :rtype: list of dict """
+    :rtype: list of dict 
+    
+    Example:
+    protein = parsePDB('1tqn').select('protein')
+
+    channels, channel_surface, channel_details = calcChannels(protein, inner_radius=0.8,
+        min_depth=3, return_details=True, output_path='channels', separate=True)
+
+    cavities, cavity_surface = calcSurfaceCavities(protein, surf_radius=3.8,
+        inner_radius=1.1, min_depth=5, min_volume=500,
+        output_path='surface_cavities', separate=True)
+
+    connected = connectChannelsToSurfaceCavities(channels, channel_details,
+        cavities, cavity_surface,
+        tolerance=1.0, min_contact_points=3, cavity_margin=4.0,
+        output_path='connected_cavities_channels.pqr', separate=True) """
 
     if tolerance <= 0:
         raise ValueError("tolerance must be greater than zero")
