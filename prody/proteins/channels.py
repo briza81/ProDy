@@ -1154,7 +1154,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     start_point_search=3.0, surf_radius=15, inner_radius=1.2, min_depth=5,
     min_volume=None, max_volume=None, max_depth=None, sparsity=6,
     cavities_only=False, diagram="homogenized", max_deviation=0.1, 
-    similarity=0.8, route_tolerance=2.0, return_details=False, **kwargs):
+    route_divergence=0.2, return_details=False, **kwargs):
     """Computes and identifies channels within a molecular structure using 
     Voronoi and Delaunay tessellations.
 
@@ -1345,7 +1345,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     :arg sparsity: Smallest centre-to-centre distance, in Angstrom, at which two
         channel surface openings (mouths) still count as separate. Two channels
         leaving closer than this are treated as sharing one opening and are merged
-        if they also take the same corridor (see ``similarity``). It acts as a
+        if they also take the same corridor (see ``route_divergence``). It acts as a
         floor: where the tessellation already measures the two mouths as wider
         than ``sparsity``, their own radii decide instead, so the value only sets
         the minimum separation a reported pair of openings can have. Being applied
@@ -1398,39 +1398,42 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         Only used when ``diagram = homogenized``.
     :type max_deviation: float
 
-    :arg similarity: Fraction (0-1) of the **shorter** of two channels, measured
-        in Angstrom along its centerline, that must run alongside the other one -
-        within the local clearance, or ``route_tolerance``, whichever is wider -
-        for the two to count as the same corridor. Two channels are merged (cheapest
-        kept) only when they take the same corridor **and** leave through the
-        same opening (see ``sparsity``); a corridor that forks near the surface
-        and exits twice is one tunnel, but two different corridors to one opening,
-        or one corridor reaching two openings, are two tunnels. Scoring the
-        shorter route means a longer channel that follows it and then runs on past
-        its exit still reads as one tunnel, which is what sharing an opening makes
-        it; the pair merges and the cheaper one is kept. The comparison is
-        geometric rather than a shared prefix of tetrahedra, so it is unaffected
-        by *where* two routes diverge (variants that split and rejoin still count
-        as one) and by ``max_deviation`` (a tetrahedron count is not
-        mesh-invariant; Angstrom are). ``1.0`` merges only pairs whose shorter
-        route lies wholly inside the other's corridor; ``0.0`` merges every
-        channel that shares an opening. Default is 0.8.
-    :type similarity: float
+    :arg route_divergence: How far, in Angstrom, two channels may part company
+        per Angstrom of channel, and still count as one. Each channel is a tube -
+        the centerline plus the clearance around it - and at every point the
+        measurement is the gap between the two tube *surfaces*: negative where
+        they overlap, since two clearance balls that share a point have no atom
+        between them and the routes are locally the same corridor. The gaps that
+        are positive are integrated along both routes and divided by the average
+        of the two channel lengths, so how far apart they get and how much of the
+        route is involved enter one number: a two Angstrom arm off a ninety
+        Angstrom channel reads differently from the same arm off a ten Angstrom
+        one. ``0.0`` merges only pairs whose tubes touch along their whole
+        length; larger values tolerate more divergence.
 
-    :arg route_tolerance: Smallest distance, in Angstrom, at which two
-        centerlines still count as the same corridor when computing
-        ``similarity``. It is a floor rather than the tolerance itself: two
-        points count as together when they are closer than the clearance of
-        either route there - the radius of a ball that holds no atom, so nothing
-        stands between them - or than this, whichever is wider. That makes the
-        test scale with the space, which has no fixed size: paths a couple of
-        Angstrom apart in a wide chamber have nothing between them, while the
-        same distance in a narrow throat spans a wall. The floor governs only
-        where the clearance falls below it, in the tightest parts of a channel.
-        Larger values merge more aggressively (nearby parallel routes read as one
-        tunnel); smaller values report finer route variants separately. Default
-        is 2.0.
-    :type route_tolerance: float
+        Measuring surfaces rather than centerlines is what lets a single value
+        serve everywhere, the question having no absolute scale: two paths a
+        couple of Angstrom apart in a wide chamber have nothing between them,
+        while the same distance in a narrow throat spans a wall.
+
+        Two channels are merged (cheapest kept) only when they take the same
+        corridor **and** leave through the same opening (see ``sparsity``); a
+        corridor that forks near the surface and exits twice is one tunnel, but
+        two different corridors to one opening, or one corridor reaching two
+        openings, are two tunnels. The comparison is geometric rather than a
+        shared prefix of tetrahedra, so it is unaffected by *where* two routes
+        diverge - variants that split and rejoin still count as one - and by
+        ``max_deviation``, a tetrahedron count not being mesh-invariant where
+        Angstrom are.
+
+        Default is 0.2, inside the band over which the answer does not change:
+        over every comparison the dedup makes on the test corpus, the pairs it
+        merges score at most 0.161 and the pairs it keeps at least 0.208. That
+        band is narrow, and the two ways out of it are not equally bad - set too
+        high it merges a corridor away, and a channel that is not reported
+        cannot be noticed, while set too low it reports a duplicate, which can
+        be seen and judged.
+    :type route_divergence: float
 
     :arg return_details: If True return an additional dictionary containing
         internal calculation data, including the channel calculator, simplices,
@@ -1792,7 +1795,6 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     _reportAtomsInputComposition(atoms, inner_radius, diagram)
     atoms = atoms.select('not water') # water is excluded from the selection
     calculator = ChannelCalculator(atoms, inner_radius=inner_radius, sparsity=sparsity,
-                                   route_tolerance=route_tolerance,
                                    edge_cost=edge_cost)
 
     coords = atoms.getCoords()
@@ -2097,7 +2099,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
 
     for cavity in c_filtered_cavities:
         calculator.dijkstra(cavity, graph, simplices, neighbors, vertices,
-                            coords, vdw_radii, similarity,
+                            coords, vdw_radii, route_divergence,
                             chamber_labels if chamber_links else None)
     # Sites, not cavities: one Dijkstra runs per site, so the number of sites is
     # what the time divides into.
@@ -5726,7 +5728,7 @@ class ChannelCalculator:
     # true width.
     CAVITY_MARKER_RADIUS = 1.00
 
-    def __init__(self, atoms, inner_radius=1.2, sparsity=6, route_tolerance=2.0,
+    def __init__(self, atoms, inner_radius=1.2, sparsity=6,
                  edge_cost='integral'):
         # Only the parameters the class actually consults are held here. surf_radius,
         # min_depth and bottleneck are stages of the pipeline, applied to the
@@ -5736,7 +5738,6 @@ class ChannelCalculator:
         self.atoms = atoms
         self.inner_radius = inner_radius
         self.sparsity = sparsity
-        self.route_tolerance = route_tolerance
         # 'integral' (clearance-profile integral) or 'bottleneck' (l/(d^2+b));
         # the Dijkstra edge weight in buildSparseGraph. Resolved per diagram by
         # calcChannels (weighted defaults to 'bottleneck').
@@ -6742,7 +6743,7 @@ class ChannelCalculator:
         return csr_matrix((weight, (rows, cols)), shape=(N, N))
 
     def dijkstra(self, cavity, graph, simplices, neighbors, vertices, points,
-                 vdw_radii, similarity=0.8, chamber_labels=None):
+                 vdw_radii, divergence=0.2, chamber_labels=None):
         # a single multi-target Dijkstra from the seed over the cavity subgraph,
         # then every exit path reconstructed from the predecessor tree - 
         # instead of one heap search per (seed, exit) pair.
@@ -7077,10 +7078,10 @@ class ChannelCalculator:
         openings = np.empty((0, 3)), np.empty(0)
         if has_mouths:
             openings = self._addOpeningChannels(
-                cavity, opening_candidates, similarity, transit_graph,
+                cavity, opening_candidates, divergence, transit_graph,
                 cavity_tetra, vertices, points, vdw_radii, simplices,
                 mouth_local, mouth_xyz, mouth_radius, seed_trees)
-        self._addDedupedLinks(cavity, link_candidates, similarity, openings)
+        self._addDedupedLinks(cavity, link_candidates, divergence, openings)
 
     def _exitImproves(self, home, candidate, seed_trees):
         """Is ``candidate`` a better way out than the ``home`` already reported?
@@ -7203,7 +7204,7 @@ class ChannelCalculator:
             self._enclosure_atoms = (coords, _kdTree(coords))
         return self._enclosure_atoms
 
-    def _addOpeningChannels(self, cavity, candidates, similarity, cavity_graph,
+    def _addOpeningChannels(self, cavity, candidates, divergence, cavity_graph,
                             cavity_tetra, vertices, points, vdw_radii, simplices,
                             mouth_local, mouth_xyz, mouth_radius, seed_trees):
         """Deduplicate routes at the opening they arrive at, then carry the
@@ -7288,8 +7289,8 @@ class ChannelCalculator:
                     continue
                 # No opening discount here: these routes stop at the opening, so
                 # the splay the discount exists for has not happened yet.
-                if self._routeCoverage(route, kept_route, route_clear,
-                                       kept_clear) >= similarity:
+                if self._routeDivergence(route, kept_route, route_clear,
+                                         kept_clear) <= divergence:
                     duplicate = True
                     break
             if not duplicate:
@@ -7436,9 +7437,9 @@ class ChannelCalculator:
                 # compared before they reached a mouth at all. Applying it again
                 # here would discount the very stretch that tells apart two
                 # corridors arriving at neighbouring openings.
-                if self._routeCoverage(route, entry['route'],
-                                       offer['route_clear'],
-                                       entry['route_clear']) >= similarity:
+                if self._routeDivergence(route, entry['route'],
+                                         offer['route_clear'],
+                                         entry['route_clear']) <= divergence:
                     home = entry
                     break
             if home is None:
@@ -7472,7 +7473,7 @@ class ChannelCalculator:
         path.reverse()
         return path
 
-    def _addDedupedLinks(self, cavity, candidates, similarity, openings=None):
+    def _addDedupedLinks(self, cavity, candidates, divergence, openings=None):
         """Keep one link per (chamber joined, corridor taken), cheapest first.
 
         The same two-part identity the channels use, with the chamber standing in
@@ -7512,100 +7513,105 @@ class ChannelCalculator:
             for kept_points, kept_clear, kept_chamber in kept:
                 if kept_chamber != joined:
                     continue
-                if self._routeCoverage(points_on_route, kept_points,
-                                       clear_on_route,
-                                       kept_clear) >= similarity:
+                if self._routeDivergence(points_on_route, kept_points,
+                                         clear_on_route,
+                                         kept_clear) <= divergence:
                     duplicate = True
                     break
             if not duplicate:
                 kept.append((points_on_route, clear_on_route, joined))
                 cavity.addLink(link)
 
-    def _routeCoverage(self, a, b, ra, rb, tol=None, center=None, radius=0.0):
-        """Fraction of the SHORTER centerline's arc length that runs alongside
-        the longer one.
+    def _routeDivergence(self, a, b, ra, rb):
+        """How far two routes part company, per Angstrom of corridor they share.
 
-        Alongside means closer than the clearance at the two points compared -
-        ``ra`` and ``rb`` are the clearances along ``a`` and ``b`` - or than
-        ``tol``, whichever is wider. A clearance sphere holds no atom, so two
-        centerlines closer than either one's clearance have nothing between
-        them, and whatever the tessellation made of them they are one corridor.
-        The reason to ask it that way is that the question has no fixed scale: a
-        flat tolerance calls two paths through one wide chamber separate
-        corridors, while the same distance in a narrow throat spans a wall. The
-        clearance is exactly the scale that varies with the space, and where the
-        space is tight it falls below ``tol``, which is why ``tol`` remains as
-        the floor.
+        ``ra`` and ``rb`` are the clearances along ``a`` and ``b`` - the radius
+        of a ball centred on the centerline that holds no atom - so each route
+        is a tube, and the question asked at every vertex is how far the two
+        tube *surfaces* are apart::
 
-        Answers "does the longer channel follow the shorter one's corridor?".
-        ``1.0`` means the shorter route lies wholly inside the longer one's
-        corridor, so they took the same way out - the longer one simply carried on
-        past the point where the shorter one surfaced. That continuation is *not*
-        counted as a difference, which is the point: two channels leaving through
-        one opening are one tunnel even if one of them runs on and exits a few
-        Angstrom further along. It is safe to ignore the continuation only because
-        this is gated on the two channels sharing an opening; without that gate,
-        scoring against the shorter route would delete long channels that head off
-        to a quite different exit.
+            g = |x - nearest vertex of the other route| - (r_here + r_there)
 
-        ``center`` and ``radius`` describe that shared opening, and the part of
-        either route lying inside it is discarded before the comparison. A tunnel
-        splays as it widens into its mouth, so sibling paths peel apart over the
-        last few Angstrom and land on neighbouring exit tetrahedra; that fan says
-        nothing about which corridor they took, and counting it makes one tunnel
-        look like several.
+        Negative means the tubes overlap there: the two balls share a point,
+        both are free of atoms, and a path from one centerline to the other runs
+        through free space, so no wall separates them. Positive is the width of
+        the gap between them. Both routes are measured, each against the other,
+        and every vertex is weighted by the arc length it stands for. The result
+        is the divergence integral per Angstrom of channel::
 
-        Note this deliberately says nothing about *where* the routes differ, or how
-        sharply the uncovered part turns away - only how much of the shorter route
-        is shared. Where two corridors genuinely part company, they do so for a
-        large fraction of the route, and the score falls.
+            I = sum of max(0, g) * weight              how far, times how long
+            L = (length of a + length of b) / 2        the average channel
+            return I / L                               Angstrom
 
-        Distances are to the nearest vertex of the other route rather than to the
-        nearest point on it, which reads slightly too far for a point falling
-        between two vertices. The error is bounded by half the local spacing, and
-        the spacing is widest where the space is - which is where the clearance
-        has already widened the tolerance to cover it."""
-        if tol is None:
-            tol = self.route_tolerance
+        Two things have to enter the answer and neither is enough alone. *How
+        far* apart they get says nothing about whether it is a brief excursion
+        or a parting of the ways; *how much* of the route diverges says nothing
+        about whether it strays by half an Angstrom or by eight. The integral
+        holds both, and dividing by the length is what makes a two Angstrom arm
+        off a ninety Angstrom trunk read differently from the same arm off a ten
+        Angstrom one.
+
+        Scaling by the clearance rather than by a fixed distance is what lets one
+        number serve everywhere: the question has no absolute scale, since two
+        paths a couple of Angstrom apart in a wide chamber have nothing between
+        them while the same distance in a narrow throat spans a wall.
+
+        Both routes are measured, rather than only the shorter one against the
+        longer, because a route that carries on past where the other ended is
+        the whole difference between them in the contained case - and the far
+        stretch then registers exactly as much as it deserves: a continuation
+        that stays inside the tube it came from contributes nothing, while one
+        that leaves contributes its full length.
+
+        Three limits worth knowing, all of them in the pairing rather than the
+        formula. The nearest vertex of the other route is not a correspondence:
+        where two routes fork, the fork stays the nearest point on the other
+        one, so a diverging tail is measured against the fork rather than
+        against anything it runs beside. The clearance grows towards a mouth, so
+        the reach grows exactly where sibling routes fan out, and a divergence
+        there can go unseen from one side - measured 7.2 Angstrom of separation
+        still reading as touching tubes, caught only because the other route's
+        arm registered from its own side. And a pair whose routes both fork into
+        wide mouths could therefore be under-reported from both sides at once."""
+
+        a = np.asarray(a, dtype=float)
+        b = np.asarray(b, dtype=float)
         ra = np.asarray(ra, dtype=float)
         rb = np.asarray(rb, dtype=float)
-        if center is not None and radius > 0:
-            outside_a = np.linalg.norm(a - center, axis=1) > radius
-            outside_b = np.linalg.norm(b - center, axis=1) > radius
-            a, ra = a[outside_a], ra[outside_a]
-            b, rb = b[outside_b], rb[outside_b]
-            if len(a) < 2 or len(b) < 2:
-                # Nothing survives outside the opening, so all either route ever
-                # did was cross the mouth: there is no corridor to tell apart.
-                return 1.0
+
+        def gaps(here, r_here, there, r_there):
+            """Surface gap at each vertex of ``here``, and its arc weight."""
+            distance, nearest = _kdTree(there).query(here)
+            gap = distance - (r_here + r_there[nearest])
+            steps = np.linalg.norm(np.diff(here, axis=0), axis=1)
+            weight = np.zeros(len(here))
+            weight[:-1] += steps / 2.0
+            weight[1:] += steps / 2.0
+            return gap, weight
+
         if len(a) < 2 or len(b) < 2:
-            return 0.0
+            # A route of one tetrahedron has no arc length to weigh, so the
+            # integral is undefined - but the question still has an answer: is
+            # that point inside the other's tube or outside it?
+            point, r_point, other, r_other = (a, ra, b, rb) if len(a) < 2 \
+                else (b, rb, a, ra)
+            if not len(point) or len(other) < 1:
+                return float('inf')
+            distance, nearest = _kdTree(other).query(point)
+            inside = (distance - (r_point + r_other[nearest])) <= 0
+            return 0.0 if bool(np.all(inside)) else float('inf')
 
-        def arclen(p):
-            return float(np.linalg.norm(np.diff(p, axis=0), axis=1).sum())
+        gap_a, weight_a = gaps(a, ra, b, rb)
+        gap_b, weight_b = gaps(b, rb, a, ra)
+        gap = np.concatenate((gap_a, gap_b))
+        weight = np.concatenate((weight_a, weight_b))
 
-        if arclen(a) >= arclen(b):
-            long_p, long_r, short_p, short_r = a, ra, b, rb
-        else:
-            long_p, long_r, short_p, short_r = b, rb, a, ra
-        steps = np.linalg.norm(np.diff(short_p, axis=0), axis=1)
-        total = steps.sum()
-        if total <= 0:
-            return 0.0
-
-        # each node carries half of each adjacent segment, so its weight is the
-        # arc length it stands for
-        weight = np.zeros(len(short_p))
-        weight[:-1] += steps / 2.0
-        weight[1:] += steps / 2.0
-
-        # The wider of the two clearances, not the narrower: the wider one alone
-        # is enough for the segment between the two points to lie in free space,
-        # since it is the radius of a ball that reaches the other centerline and
-        # holds no atom.
-        distance, nearest = _kdTree(long_p).query(short_p)
-        reach = np.maximum(tol, np.maximum(short_r, long_r[nearest]))
-        return float(weight[distance <= reach].sum() / total)
+        # Each route's weights sum to its own arc length, so the two together
+        # are the total and half of that is the average channel.
+        span = float(weight.sum()) / 2.0
+        if span <= 0:
+            return float('inf')
+        return float((np.maximum(gap, 0.0) * weight).sum() / span)
 
     def calculateMaxRadius(self, vertice, points, vdw_radii, simp):
         atom_positions = points[simp]
