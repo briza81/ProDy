@@ -38,7 +38,7 @@ __all__ =['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames',
            'getPoreResidueNamesMultipleFrames', 'scanChannelParameters',
            'getLinkParameters', 'getLinkResidueNames',
            'getLinkParametersMultipleFrames', 'getLinkResidueNamesMultipleFrames',
-           'scanSurfaceCavityParameters',
+           'scanSurfaceCavityParameters', 'connectChannelsToSurfaceCavities',
            'calcFrequentObjectResidues', 'showFrequentObjectResidues']
 
 # Van der Waals radii in Angstrom, by element symbol (upper case). The radii the
@@ -372,6 +372,233 @@ def _calcPoresFromChannelsWorker(args):
     LOGGER.info("Frame/model: {0}".format(frame_nr))
     return calcPoresFromChannels(channels, details, output_path=output_path,
                                  separate=separate, **kwargs)
+
+
+def _findContactRun(mask, min_contact_points):
+    """Return the first index of the last valid contiguous True run in *mask*.
+
+    The path is assumed to be oriented from the protein interior towards the
+    surface cavity. The run nearest the surface end is preferred. """
+
+    mask = np.asarray(mask, dtype=bool)
+
+    if len(mask) == 0:
+        return None
+
+    end = len(mask) - 1
+
+    while end >= 0:
+        if not mask[end]:
+            end -= 1
+            continue
+
+        start = end
+
+        while start > 0 and mask[start - 1]:
+            start -= 1
+
+        if end - start + 1 >= min_contact_points:
+            return start
+
+        end = start - 1
+
+    return None
+
+
+def _selectLocalSurfaceCavity(cavity, cavity_surface, channel,
+    tolerance=1.0, cavity_margin=2.0, num_samples=5):
+    """Select the connected part of a surface cavity associated with a channel.
+
+    Surface-cavity tetrahedra are first filtered according to their proximity
+    to the channel surface. Only the connected component containing the actual
+    channel-cavity contact region is retained. """
+
+    cavity_tetrahedra = np.asarray(cavity.tetrahedra, dtype=np.intp)
+
+    if len(cavity_tetrahedra) == 0:
+        return cavity_tetrahedra
+    
+    if cavity_margin is None:
+        return cavity_tetrahedra.copy()
+    
+    cavity_simplices = np.asarray(cavity_surface[3])
+    cavity_vertices = np.asarray(cavity_surface[4])
+
+    cavity_xyz = cavity_vertices[cavity_tetrahedra]
+
+    # Sample the reconstructed channel including its radius.
+    channel_centers, channel_radii = _sampleObjectSpheres(channel, num_samples)
+
+    # Distance of every cavity Voronoi vertex from its nearest sampled channel center.
+    channel_tree = _kdTree(channel_centers)
+    distances, nearest = channel_tree.query(cavity_xyz)
+    nearest_radii = channel_radii[nearest]
+
+    # Seed tetrahedra are in direct contact with the channel centerline.
+    contact_mask = distances <= tolerance
+
+    if not np.any(contact_mask):
+        return np.array([], dtype=np.intp)
+
+    # Candidate cavity tetrahedra must remain close to the actual channel
+    # surface, not merely to one connection point.
+    candidate_mask = distances <= nearest_radii + cavity_margin
+
+    # Contact tetrahedra must always remain candidates.
+    candidate_mask |= contact_mask
+    candidate_local = np.where(candidate_mask)[0]
+    contact_local = np.where(contact_mask)[0]
+
+    if len(candidate_local) == 0:
+        return np.array([], dtype=np.intp)
+
+    # Build topology only inside this cavity. Two Delaunay tetrahedra are
+    # neighbours if they share one triangular face, i.e. three atom indices.
+    face_to_tetrahedra = {}
+
+    for local_index in candidate_local:
+        tetra = int(cavity_tetrahedra[local_index])
+        simplex = cavity_simplices[tetra]
+
+        faces = (tuple(sorted((simplex[0], simplex[1], simplex[2]))),
+            tuple(sorted((simplex[0], simplex[1], simplex[3]))),
+            tuple(sorted((simplex[0], simplex[2], simplex[3]))),
+            tuple(sorted((simplex[1], simplex[2], simplex[3]))))
+
+        for face in faces:
+            face_to_tetrahedra.setdefault(face, []).append(local_index)
+
+    adjacency = {int(i): set() for i in candidate_local}
+
+    for tetrahedra in face_to_tetrahedra.values():
+        if len(tetrahedra) < 2:
+            continue
+
+        for i in tetrahedra:
+            for j in tetrahedra:
+                if i != j:
+                    adjacency[int(i)].add(int(j))
+
+    # Flood-fill from every genuine channel-cavity contact tetrahedron.
+    seeds = [int(i) for i in contact_local if candidate_mask[i]]
+
+    if not seeds:
+        return np.array([], dtype=np.intp)
+
+    visited = set(seeds)
+    stack = list(seeds)
+
+    while stack:
+        current = stack.pop()
+
+        for neighbor in adjacency.get(current, ()):
+            if neighbor in visited:
+                continue
+
+            visited.add(neighbor)
+            stack.append(neighbor)
+
+    selected_local = np.array(sorted(visited), dtype=np.intp)
+
+    return cavity_tetrahedra[selected_local]
+
+
+def _saveConnectedCavityChannels(connected, cavity_surface, filename,
+    separate=False, num_samples=5):
+    """Save local surface-cavity regions together with connected channels."""
+
+    if PY3K:
+        from pathlib import Path
+    else:
+        from pathlib2 import Path
+
+    filename = Path(filename)
+
+    if filename.is_dir():
+        filename = filename / 'connected_cavities_channels.pqr'
+        separate_stem = ''
+    else:
+        separate_stem = None
+
+        if filename.suffix not in ('.pdb', '.pqr'):
+            filename = filename.with_suffix('.pqr')
+
+    cavity_vertices = cavity_surface[4]
+
+
+    def records(result, atom_index=1):
+        cavity_index = result['cavity_index']
+        channel_index = result['channel_index']
+        cavity = result['cavity']
+        channel = result['trimmed_channel']
+        cavity_tetrahedra = result['cavity_tetrahedra']
+        connection_point = result['connection_point']
+
+        lines = []
+        lines.append("REMARK   connected cavity %d channel %d  "
+            "connection=%.3f %.3f %.3f A\n" %
+            (cavity_index, channel_index, connection_point[0],
+             connection_point[1], connection_point[2]))
+
+        cavity_xyz = cavity_vertices[cavity_tetrahedra]
+
+        lines.append("REMARK   local cavity %d  tetrahedra=%d  "
+            "original_tetrahedra=%d\n" %
+            (cavity_index, len(cavity_tetrahedra), len(cavity.tetrahedra)))
+
+        cavity_radius = ChannelCalculator.CAVITY_MARKER_RADIUS
+
+        for x, y, z in cavity_xyz:
+            lines.append("ATOM  %5d  H   FIL C%4d    "
+                "%8.3f%8.3f%8.3f%6.2f%6.2f\n" %
+                (atom_index, cavity_index + 1, x, y, z, 1.00, cavity_radius))
+            atom_index += 1
+
+        channel_lines, samples = calculator_records(channel_index, channel, atom_index, num_samples)
+        lines.extend(channel_lines)
+        atom_index += samples
+        lines.append("\n")
+
+        return lines, atom_index
+
+    def calculator_records(channel_index, channel, atom_index, num_samples):
+        centers, radii = _sampleObjectSpheres(channel, num_samples)
+
+        lines = [ChannelCalculator._channelRemark(channel_index, channel, label='channel')]
+
+        for i, (x, y, z, radius) in enumerate(
+                zip(centers[:, 0], centers[:, 1],
+                    centers[:, 2], radii),
+                start=atom_index):
+
+            lines.append("ATOM  %5d  H   FIL H%4d    "
+                "%8.3f%8.3f%8.3f%6.2f%6.2f\n" %
+                (i, channel_index + 1, x, y, z, 1.00, radius))
+
+        for i in range(atom_index, atom_index + len(centers) - 1):
+            lines.append("CONECT%5d%5d\n" % (i, i + 1))
+
+        return lines, len(centers)
+
+    with open(str(filename), 'w') as handle:
+        atom_index = 1
+
+        for result in connected:
+            lines, atom_index = records(result, atom_index)
+            handle.writelines(lines)
+
+    LOGGER.info("Connected surface cavities and channels saved to {0}.".format(filename))
+
+    if separate:
+        for pair_index, result in enumerate(connected):
+
+            pair_filename = _numberedPath(filename, 'cavchl', pair_index, stem=separate_stem)
+
+            with open(str(pair_filename), 'w') as handle:
+                lines, _ = records(result, 1)
+                handle.writelines(lines)
+
+        LOGGER.info("Saved {0} individual connected cavity-channel file(s).".format(len(connected)))
 
 
 def _reportAtomsInputComposition(atoms, inner_radius=None, diagram=None):
@@ -2587,6 +2814,245 @@ def calcPoresFromChannels(channels, details, min_end_to_end=None, max_end_to_end
                                      separate_stem=separate_stem)
 
     return pores
+
+
+def connectChannelsToSurfaceCavities(channels, channel_details, cavities,
+    cavity_surface, tolerance=1.0, min_contact_points=2, cavity_margin=2.0,
+    output_path=None, separate=False):
+    """Connect independently calculated channels with surface cavities.
+
+    Channels and surface cavities may be calculated using different parameters.
+    For every connected channel-cavity pair, the overlapping surface-end part
+    of the channel is removed and only the local connected region of the
+    surface cavity associated with that channel is retained.
+
+    :arg channels: Channels returned by :func:`calcChannels`.
+    :type channels: list
+
+    :arg channel_details: Additional data returned by
+        ``calcChannels(..., return_details=True)``.
+    :type channel_details: dict
+
+    :arg cavities: Surface cavities returned by
+        :func:`calcSurfaceCavities`.
+    :type cavities: list
+
+    :arg cavity_surface: Surface information returned by
+        :func:`calcSurfaceCavities`.
+    :type cavity_surface: list
+
+    :arg tolerance: Maximum distance in Angstrom between channel and
+        surface-cavity Voronoi vertices used to define direct contact.
+        Default is 1.0.
+    :type tolerance: float
+
+    :arg min_contact_points: Minimum number of consecutive channel
+        tetrahedra required to identify a channel-cavity contact.
+        Default is 2.
+    :type min_contact_points: int
+
+    :arg cavity_margin: Additional distance in Angstrom beyond the local
+        channel radius used when selecting the cavity region associated
+        with the channel. Default is 2.0.
+    :type cavity_margin: float
+
+    :arg output_path: Optional path for the resulting PQR/PDB file.
+    :type output_path: str or pathlib.Path or None
+
+    :arg separate: If True, each connected cavity-channel pair is also
+        saved to a separate file. Default is False.
+    :type separate: bool
+
+    :returns: Connected channel-cavity results.
+    :rtype: list of dict 
+    
+    Example:
+    protein = parsePDB('1tqn').select('protein')
+
+    channels, channel_surface, channel_details = calcChannels(protein, inner_radius=0.8,
+        min_depth=3, return_details=True, output_path='channels', separate=True)
+
+    cavities, cavity_surface = calcSurfaceCavities(protein, surf_radius=3.8,
+        inner_radius=1.1, min_depth=5, min_volume=500,
+        output_path='surface_cavities', separate=True)
+
+    connected = connectChannelsToSurfaceCavities(channels, channel_details,
+        cavities, cavity_surface,
+        tolerance=1.0, min_contact_points=3, cavity_margin=4.0,
+        output_path='connected_cavities_channels.pqr', separate=True) """
+
+    if tolerance <= 0:
+        raise ValueError("tolerance must be greater than zero")
+
+    if min_contact_points < 1:
+        raise ValueError("min_contact_points must be at least 1")
+
+    if cavity_margin is not None and cavity_margin < 0:
+        raise ValueError("cavity_margin must be non-negative or None")
+
+    if not isinstance(channel_details, dict):
+        raise TypeError("channel_details must be returned by "
+            "calcChannels(..., return_details=True)")
+
+    required = ('calculator', 'simplices', 'vertices', 'coords', 'vdw_radii')
+    missing = [key for key in required if key not in channel_details]
+
+    if missing:
+        raise ValueError("channel_details is missing: {0}".format(", ".join(missing)))
+
+    if cavity_surface is None or len(cavity_surface) < 5:
+        raise ValueError("cavity_surface must be returned by calcSurfaceCavities()")
+
+    calculator = channel_details['calculator']
+    simplices = channel_details['simplices']
+    vertices = channel_details['vertices']
+    coords = channel_details['coords']
+    vdw_radii = channel_details['vdw_radii']
+
+    cavity_vertices = cavity_surface[4]
+    connected = []
+    cavity_trees = []
+
+    for cavity in cavities:
+        tetrahedra = np.asarray(cavity.tetrahedra, dtype=np.intp)
+
+        if len(tetrahedra) == 0:
+            cavity_trees.append(None)
+            continue
+
+        cavity_trees.append(_kdTree(cavity_vertices[tetrahedra]))
+
+    for channel_index, channel in enumerate(channels):
+        path = np.asarray(channel.tetrahedra, dtype=np.intp)
+
+        if len(path) < 2:
+            continue
+
+        for cavity_index, (cavity, cavity_tree) in enumerate(zip(cavities, cavity_trees)):
+
+            if cavity_tree is None:
+                continue
+
+            channel_xyz = vertices[path]
+            distances, _ = cavity_tree.query(channel_xyz)
+
+            # Orient the path from protein interior toward the cavity.
+            # A channel returned by calcChannels normally already follows
+            # seed -> surface, but this keeps the post-processing independent
+            # of path orientation.
+            if distances[0] < distances[-1]:
+                oriented_path = path[::-1].copy()
+                oriented_distances = distances[::-1].copy()
+            else:
+                oriented_path = path.copy()
+                oriented_distances = distances.copy()
+
+            contact_mask = oriented_distances <= tolerance
+            connection_index = _findContactRun(contact_mask, min_contact_points)
+
+            if connection_index is None:
+                continue
+
+            # At least two vertices are required by CubicSpline.
+            if connection_index < 1:
+                continue
+
+            # Retain the first contact vertex so the reconstructed channel
+            # terminates directly at the cavity.
+            trimmed_path = oriented_path[:connection_index + 1]
+
+            if len(trimmed_path) < 2:
+                continue
+
+            centerline_spline, radius_spline, length, bottleneck, volume = \
+                calculator.processChannel(trimmed_path, vertices, coords, vdw_radii, simplices)
+
+            trimmed_channel = Channel(trimmed_path, centerline_spline, radius_spline,
+                                        length, bottleneck, volume, cost=None)
+
+            trimmed_channel.origin = getattr(channel, 'origin', None)
+            trimmed_channel.destination = getattr(channel, 'destination', None)
+
+            connection_point = vertices[trimmed_path[-1]].copy()
+
+            local_cavity_tetrahedra = _selectLocalSurfaceCavity(cavity, cavity_surface,
+                    trimmed_channel, tolerance=tolerance, cavity_margin=cavity_margin)
+
+            if len(local_cavity_tetrahedra) == 0:
+                continue
+
+            connected.append({'cavity_index': cavity_index, 
+                'channel_index': channel_index,
+                'cavity': cavity, 'channel': channel, 
+                'trimmed_channel': trimmed_channel,
+                'cavity_tetrahedra': local_cavity_tetrahedra, 
+                'connection_point': connection_point,
+                'minimum_distance': float(np.min(distances))})
+
+    LOGGER.info(
+        "Detected {0} connected surface cavity-channel pair(s).".format(len(connected)))
+
+    connected_cavities = set()
+    connected_channels = set()
+
+    if connected:
+        LOGGER.info("Connected surface cavities and channels:")
+
+        for result in connected:
+            cavity_index = result['cavity_index']
+            channel_index = result['channel_index']
+            channel = result['channel']
+            origin = getattr(channel, 'origin', None)
+
+            connected_cavities.add(cavity_index)
+            connected_channels.add(channel_index)
+
+            if origin is None:
+                channel_label = "channel {0}".format(channel_index)
+            else:
+                channel_label = "channel {0} (sp{1})".format(channel_index, origin)
+
+            LOGGER.info("    cavity {0} <-> {1}, minimum distance {2:.2f} A, "
+                    "local cavity {3}/{4} tetrahedra".format(
+                    cavity_index, 
+                    channel_label, 
+                    result['minimum_distance'],
+                    len(result['cavity_tetrahedra']), 
+                    len(result['cavity'].tetrahedra)))
+
+    unconnected_cavities = [i for i in range(len(cavities))
+        if i not in connected_cavities]
+
+    unconnected_channels = [i for i in range(len(channels))
+        if i not in connected_channels]
+
+    if unconnected_cavities:
+        LOGGER.info("Surface cavities without connected channels: {0}.".format(
+                ", ".join("cavity {0}".format(i)
+                    for i in unconnected_cavities)))
+    else:
+        LOGGER.info("All surface cavities have at least one connected channel.")
+
+    if unconnected_channels:
+        channel_labels = []
+
+        for i in unconnected_channels:
+            origin = getattr(channels[i], 'origin', None)
+
+            if origin is None:
+                channel_labels.append("channel {0}".format(i))
+            else:
+                channel_labels.append("channel {0} (sp{1})".format(i, origin))
+
+        LOGGER.info("Channels without connected surface cavities: {0}.".format(", ".join(channel_labels)))
+    
+    else:
+        LOGGER.info("All channels have at least one connected surface cavity.")
+
+    if output_path is not None:
+        _saveConnectedCavityChannels(connected, cavity_surface, output_path, separate=separate)
+
+    return connected
             
                 
 def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None, 
