@@ -7554,18 +7554,16 @@ class ChannelCalculator:
 
         Both are routes the corridor test has already called one channel, so this
         is not asking which corridor to keep but which of two endings to show for
-        it. Calibrated against channels judged by eye over a corpus of twenty
-        structures: of the exchanges a bare "is the mouth wider" rule made, fewer
-        than half were improvements, and the tests below are what the other half
-        turned out to have in common.
+        it. A bare "is the mouth wider" rule is not enough on its own; the tests
+        below are what separates an exchange worth making from one that trades a
+        longer route for a number.
 
         An exchange has to be an improvement in one of two ways, and may not be a
         regression in either.
 
         *Enabler: a wider mouth.* By at least ``min_gain``, because clearances a
-        few hundredths apart are one hole sampled by two tetrahedra and buying
-        that costs a longer route for nothing. The worthwhile exchanges widen the
-        exit by 0.2 to 1.9 Angstrom and the worthless ones by 0.01 to 0.04.
+        few hundredths apart are one hole sampled by two tetrahedra, and buying
+        that costs a longer route for nothing.
 
         *Enabler: a wider bottleneck.* The channel's own headline number, which a
         mouth width can move without touching. It matters on exactly the channels
@@ -7573,21 +7571,32 @@ class ChannelCalculator:
         channel, and holding those to the mouth threshold would refuse a real
         improvement over a few hundredths of an Angstrom.
 
-        *Guard: neither may go backwards.* An exchange may not narrow the mouth to
-        widen the bottleneck, nor narrow the bottleneck to widen the mouth. The
-        second is the one that bites: the two routes are identical up to their
-        fork, so a candidate whose bottleneck is lower must be pinching within the
-        stretch it adds - it is reaching a better exit by threading a tighter gap
-        than anything on the route it replaces.
+        *Guard: the bottleneck may never go backwards.* The two routes are
+        identical up to their fork, so a candidate whose bottleneck is lower must
+        be pinching within the stretch it adds - it is reaching a better exit by
+        threading a tighter gap than anything on the route it replaces.
+
+        *Guard: nor may the mouth, while the bottleneck is unchanged.* Only
+        while: the bottleneck is the tightest gate on the whole route, the
+        terminal one into the mouth included, so a narrower exit cannot be hiding
+        a tighter approach behind it - a neck just inside a wide mouth is a gate
+        like any other and is already in the number. Where the candidate is
+        genuinely wider at its tightest point, that is the passage improving, and
+        a wider mouth on the route being replaced buys nothing when its own pinch
+        lies upstream of it: the wide hole cannot be reached through the narrow
+        one. Where the bottleneck does not improve, the mouth is the only thing
+        left to compare and this guard is the whole of it. What the exchange may
+        still not do is bury the exit, which clearance cannot see and the
+        enclosure test below can.
 
         *Not much dearer, measured on the tails.* Only what follows the fork is
         being chosen; the shared head is common to both by construction. Charging
-        the difference against the whole cost makes the verdict depend on how much
-        identical prefix happens to precede the fork - the same decision read as
-        +0.9% on a long channel and +11.4% on a short one, and refused the short
-        one. On tails the same three decisions read +24%, +21% and +26%. The head
-        is discounted only when both routes come from one seed's tree and so
-        really do share it; otherwise the whole cost is compared, as before.
+        the difference against the whole cost would make the verdict depend on how
+        much identical prefix happens to precede the fork, so that one and the
+        same decision reads as a small increase on a long channel and a large one
+        on a short channel, and is refused only on the short one. The head is
+        discounted only when both routes come from one seed's tree and so really
+        do share it; otherwise the whole cost is compared, as before.
 
         *Not the same ending continued.* Both routes are paths in one Dijkstra
         tree, so they share a prefix and part at a fork. When the fork is at the
@@ -7599,31 +7608,28 @@ class ChannelCalculator:
         *No more buried than what it replaces.* This is the test that catches what
         clearance cannot. A wider mouth can sit deeper in a groove than the
         narrower one beside it, and then the channel gains a number and loses its
-        ending: measured, exchanges that widened the exit by 0.24 to 0.52 Angstrom
-        while burying it were exactly the ones that looked wrong. Burial is read
-        at two scales because neither works alone - inside a wide lumen the closer
-        scale saturates near zero and stops discriminating, while the further one
-        misses a mouth that is pinched only locally. A tolerance of one ray keeps
-        the sampling's own quantum from reading as a change."""
+        ending. Burial is read at two scales because neither works alone - inside
+        a wide lumen the closer scale saturates near zero and stops
+        discriminating, while the further one misses a mouth that is pinched only
+        locally. A tolerance of one ray keeps the sampling's own quantum from
+        reading as a change."""
         # Least widening of the mouth, in Angstrom, that enables an exchange on
-        # its own. The exchanges worth making widen the exit by 0.2 to 1.9 and
-        # the worthless ones by 0.01 to 0.04; 0.15 sits clear of the nearest
-        # candidates on either side of it in that corpus, 0.09 and 0.18.
+        # its own: above the width two tetrahedra sampling one hole differ by,
+        # below the width at which an exit is really a different one.
         min_gain = 0.15
         # How much dearer the candidate's tail may be than the tail it replaces.
-        # Not a knife-edge: nothing in the corpus falls between 27% and 62%, so
-        # anywhere in that range gives identical results.
         max_tail_cost = 0.30
         scales = (6.0, 8.0)          # Angstrom; see the paragraph on burial above
         # How much of its own path a candidate must give up to be going somewhere
-        # else. The measured gap is wide: continuations give up 0.2 Angstrom, the
-        # next-shallowest genuine alternative 1.2.
+        # else rather than continuing past the reported mouth.
         min_fork = 1.0
         rays = 32
         eps = 1e-9
 
-        if (candidate['clear'] < home['clear'] - eps
-                or candidate['bottleneck'] < home['bottleneck'] - eps):
+        if candidate['bottleneck'] < home['bottleneck'] - eps:
+            return False
+        if (candidate['bottleneck'] <= home['bottleneck'] + eps
+                and candidate['clear'] < home['clear'] - eps):
             return False
         if not (candidate['clear'] >= home['clear'] + min_gain
                 or candidate['bottleneck'] > home['bottleneck'] + eps):
