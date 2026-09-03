@@ -1399,9 +1399,9 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     :type max_deviation: float
 
     :arg similarity: Fraction (0-1) of the **shorter** of two channels, measured
-        in Angstrom along its centerline, that must run within
-        ``route_tolerance`` of the other one for the two to count as the same
-        corridor. Two channels are merged (cheapest
+        in Angstrom along its centerline, that must run alongside the other one -
+        within the local clearance, or ``route_tolerance``, whichever is wider -
+        for the two to count as the same corridor. Two channels are merged (cheapest
         kept) only when they take the same corridor **and** leave through the
         same opening (see ``sparsity``); a corridor that forks near the surface
         and exits twice is one tunnel, but two different corridors to one opening,
@@ -1417,10 +1417,19 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         channel that shares an opening. Default is 0.8.
     :type similarity: float
 
-    :arg route_tolerance: How far apart, in Angstrom, two centerlines may drift
-        and still count as the same corridor when computing ``similarity``. Larger values merge more
-        aggressively (nearby parallel routes read as one tunnel); smaller values
-        report finer route variants separately. Default is 2.0.
+    :arg route_tolerance: Smallest distance, in Angstrom, at which two
+        centerlines still count as the same corridor when computing
+        ``similarity``. It is a floor rather than the tolerance itself: two
+        points count as together when they are closer than the clearance of
+        either route there - the radius of a ball that holds no atom, so nothing
+        stands between them - or than this, whichever is wider. That makes the
+        test scale with the space, which has no fixed size: paths a couple of
+        Angstrom apart in a wide chamber have nothing between them, while the
+        same distance in a narrow throat spans a wall. The floor governs only
+        where the clearance falls below it, in the tightest parts of a channel.
+        Larger values merge more aggressively (nearby parallel routes read as one
+        tunnel); smaller values report finer route variants separately. Default
+        is 2.0.
     :type route_tolerance: float
 
     :arg return_details: If True return an additional dictionary containing
@@ -7261,12 +7270,14 @@ class ChannelCalculator:
                     return not (here & exits_in)
             return False
 
-        kept = []    # (route, opening, path_local, arrival, cost, seed_index)
+        kept = []    # (route, clearance, opening, path_local, arrival, cost,
+                     #  seed_index)
         for path_local, cost, arrival, opening, seed in sorted(
                 candidates, key=lambda c: c[1]):
             route = vertices[cavity_tetra[path_local]]
+            route_clear = self._vertex_clearance[cavity_tetra[path_local]]
             duplicate = False
-            for kept_route, kept_opening, _p, _a, _c, _s in kept:
+            for kept_route, kept_clear, kept_opening, _p, _a, _c, _s in kept:
                 # Two routes share an opening when the balls covering their
                 # arrivals overlap at all. Mouth circumcenters sit a fraction of
                 # an Angstrom apart, so one opening is sampled by many nearly
@@ -7277,11 +7288,13 @@ class ChannelCalculator:
                     continue
                 # No opening discount here: these routes stop at the opening, so
                 # the splay the discount exists for has not happened yet.
-                if self._routeCoverage(route, kept_route) >= similarity:
+                if self._routeCoverage(route, kept_route, route_clear,
+                                       kept_clear) >= similarity:
                     duplicate = True
                     break
             if not duplicate:
-                kept.append((route, opening, path_local, arrival, cost, seed))
+                kept.append((route, route_clear, opening, path_local, arrival,
+                             cost, seed))
 
         centres = np.empty((0, 3))
         radii = np.empty(0)
@@ -7294,14 +7307,14 @@ class ChannelCalculator:
         # one's opening, costed from its arrival rather than from the seed. The
         # distance from the seed would pick whichever mouth is cheapest to reach
         # overall, by a path that need not pass through this arrival at all.
-        sources = [arrival for _r, _o, _p, arrival, _c, _s in kept]
+        sources = [arrival for _r, _rc, _o, _p, arrival, _c, _s in kept]
         distances, predecessors = sparse_dijkstra(
             cavity_graph, directed=True, indices=sources,
             return_predecessors=True)
         distances = np.atleast_2d(distances)
         predecessors = np.atleast_2d(predecessors)
 
-        for i, (_route, opening, path_local, arrival, cost, seed) in \
+        for i, (_route, _clear, opening, path_local, arrival, cost, seed) in \
                 enumerate(kept):
             reachable = [k for k in sorted(opening)
                          if np.isfinite(distances[i][mouth_local[k]])]
@@ -7391,6 +7404,7 @@ class ChannelCalculator:
                 else 0.0
             extended.append(dict(
                 cost=float(cost), channel=channel, route=vertices[path_global],
+                route_clear=self._vertex_clearance[path_global],
                 xyz=exit_xyz, radius=exit_radius, clear=exit_clear,
                 bottleneck=float(channel.bottleneck), path=path_full,
                 seed=seed, from_tree=from_tree))
@@ -7422,7 +7436,9 @@ class ChannelCalculator:
                 # compared before they reached a mouth at all. Applying it again
                 # here would discount the very stretch that tells apart two
                 # corridors arriving at neighbouring openings.
-                if self._routeCoverage(route, entry['route']) >= similarity:
+                if self._routeCoverage(route, entry['route'],
+                                       offer['route_clear'],
+                                       entry['route_clear']) >= similarity:
                     home = entry
                     break
             if home is None:
@@ -7479,30 +7495,47 @@ class ChannelCalculator:
         link is dropped outright: what came before is the seed's route to the
         surface, which is a channel, and is already reported as one."""
 
-        kept = []                                   # (points, chamber joined)
+        kept = []                     # (points, clearance, chamber joined)
         centres, radii = openings if openings is not None else (None, None)
         for link, joined in sorted(candidates, key=lambda c: c[0].cost):
             points_on_route = np.asarray(link.centerline_spline(
+                link.centerline_spline.x))
+            # The radius profile shares the centerline's parameter, so reading it
+            # at the same knots gives the clearance at each of those points.
+            clear_on_route = np.asarray(link.radius_spline(
                 link.centerline_spline.x))
             if centres is not None and len(centres):
                 if (np.linalg.norm(points_on_route[:, None, :] - centres,
                                    axis=2) < radii).any():
                     continue
             duplicate = False
-            for kept_points, kept_chamber in kept:
+            for kept_points, kept_clear, kept_chamber in kept:
                 if kept_chamber != joined:
                     continue
-                if self._routeCoverage(points_on_route,
-                                       kept_points) >= similarity:
+                if self._routeCoverage(points_on_route, kept_points,
+                                       clear_on_route,
+                                       kept_clear) >= similarity:
                     duplicate = True
                     break
             if not duplicate:
-                kept.append((points_on_route, joined))
+                kept.append((points_on_route, clear_on_route, joined))
                 cavity.addLink(link)
 
-    def _routeCoverage(self, a, b, tol=None, center=None, radius=0.0):
-        """Fraction of the SHORTER centerline's arc length that runs within ``tol``
-        Angstrom of the longer one.
+    def _routeCoverage(self, a, b, ra, rb, tol=None, center=None, radius=0.0):
+        """Fraction of the SHORTER centerline's arc length that runs alongside
+        the longer one.
+
+        Alongside means closer than the clearance at the two points compared -
+        ``ra`` and ``rb`` are the clearances along ``a`` and ``b`` - or than
+        ``tol``, whichever is wider. A clearance sphere holds no atom, so two
+        centerlines closer than either one's clearance have nothing between
+        them, and whatever the tessellation made of them they are one corridor.
+        The reason to ask it that way is that the question has no fixed scale: a
+        flat tolerance calls two paths through one wide chamber separate
+        corridors, while the same distance in a narrow throat spans a wall. The
+        clearance is exactly the scale that varies with the space, and where the
+        space is tight it falls below ``tol``, which is why ``tol`` remains as
+        the floor.
 
         Answers "does the longer channel follow the shorter one's corridor?".
         ``1.0`` means the shorter route lies wholly inside the longer one's
@@ -7525,12 +7558,22 @@ class ChannelCalculator:
         Note this deliberately says nothing about *where* the routes differ, or how
         sharply the uncovered part turns away - only how much of the shorter route
         is shared. Where two corridors genuinely part company, they do so for a
-        large fraction of the route, and the score falls."""
+        large fraction of the route, and the score falls.
+
+        Distances are to the nearest vertex of the other route rather than to the
+        nearest point on it, which reads slightly too far for a point falling
+        between two vertices. The error is bounded by half the local spacing, and
+        the spacing is widest where the space is - which is where the clearance
+        has already widened the tolerance to cover it."""
         if tol is None:
             tol = self.route_tolerance
+        ra = np.asarray(ra, dtype=float)
+        rb = np.asarray(rb, dtype=float)
         if center is not None and radius > 0:
-            a = a[np.linalg.norm(a - center, axis=1) > radius]
-            b = b[np.linalg.norm(b - center, axis=1) > radius]
+            outside_a = np.linalg.norm(a - center, axis=1) > radius
+            outside_b = np.linalg.norm(b - center, axis=1) > radius
+            a, ra = a[outside_a], ra[outside_a]
+            b, rb = b[outside_b], rb[outside_b]
             if len(a) < 2 or len(b) < 2:
                 # Nothing survives outside the opening, so all either route ever
                 # did was cross the mouth: there is no corridor to tell apart.
@@ -7541,7 +7584,10 @@ class ChannelCalculator:
         def arclen(p):
             return float(np.linalg.norm(np.diff(p, axis=0), axis=1).sum())
 
-        long_p, short_p = (a, b) if arclen(a) >= arclen(b) else (b, a)
+        if arclen(a) >= arclen(b):
+            long_p, long_r, short_p, short_r = a, ra, b, rb
+        else:
+            long_p, long_r, short_p, short_r = b, rb, a, ra
         steps = np.linalg.norm(np.diff(short_p, axis=0), axis=1)
         total = steps.sum()
         if total <= 0:
@@ -7553,8 +7599,13 @@ class ChannelCalculator:
         weight[:-1] += steps / 2.0
         weight[1:] += steps / 2.0
 
-        near = _kdTree(long_p).query(short_p)[0] <= tol
-        return float(weight[near].sum() / total)
+        # The wider of the two clearances, not the narrower: the wider one alone
+        # is enough for the segment between the two points to lie in free space,
+        # since it is the radius of a ball that reaches the other centerline and
+        # holds no atom.
+        distance, nearest = _kdTree(long_p).query(short_p)
+        reach = np.maximum(tol, np.maximum(short_r, long_r[nearest]))
+        return float(weight[distance <= reach].sum() / total)
 
     def calculateMaxRadius(self, vertice, points, vdw_radii, simp):
         atom_positions = points[simp]
