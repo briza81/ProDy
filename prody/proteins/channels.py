@@ -2577,6 +2577,10 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
                                          separate_path=output_path,
                                          separate_stem=separate_stem,
                                          name_sites=name_sites)
+        # Only for a run told a directory. Told a file, the parent is usually
+        # the working directory, and a run has no business leaving a script there.
+        if into_directory:
+            _writeVisScript(output_path.parent)
     else:
         LOGGER.info("No output path given.")
 
@@ -2798,7 +2802,8 @@ def calcPoresFromChannels(channels, details, min_end_to_end=None, max_end_to_end
         # As in calcChannels: a directory names no run, so its placeholder file
         # name is kept out of the per-pore ones.
         separate_stem = None
-        if output_path.is_dir():
+        into_directory = output_path.is_dir()
+        if into_directory:
             output_path = output_path / "pores.pqr"
             separate_stem = ''
         elif output_path.suffix not in (".pdb", ".pqr"):
@@ -2812,6 +2817,9 @@ def calcPoresFromChannels(channels, details, min_end_to_end=None, max_end_to_end
         calculator.saveChannelsToPdb(pores, output_path, separate=separate,
                                      tag='pore', label='pore',
                                      separate_stem=separate_stem)
+        # as in calcChannels, and globbing the pores rather than the channels
+        if into_directory:
+            _writeVisScript(output_path.parent, 'pore*.pqr')
 
     return pores
 
@@ -8986,3 +8994,222 @@ class ChannelCalculator:
             cavity.tetrahedra = np.array([
                 tetra for tetra in cavity.tetrahedra
                 if cavity.tetrahedra_depths.get(tetra, np.inf) <= max_depth])
+
+
+#: Source of the PyMOL viewer that :func:`_writeVisScript` leaves beside the
+#: PQR output. Held inline so that this module carries everything it writes,
+#: and raw so the rank patterns keep their backslashes.
+_VIS_CHANNELS_SCRIPT = r'''import colorsys
+import glob
+import os
+import re
+import sys
+
+# --- Parse command-line args ---
+# Invoke as:  pymol vis_channels.py -- protein.pdb "por*chl*.pqr"
+# The regex MUST be quoted so the shell doesn't glob-expand it before PyMOL sees it.
+protein_file = None
+channel_regex = None
+for arg in sys.argv[1:]:
+    if arg == "--":
+        continue
+    if os.path.isfile(arg):
+        if protein_file is None:
+            protein_file = arg
+    elif channel_regex is None:
+        channel_regex = arg
+
+if channel_regex is None:
+    channel_regex = "*chl*.pqr"   # fallback default
+print(f"Using channel regex: {channel_regex}")
+
+# --- Palette ---
+# CAVER 3's first six colours, from its out/pymol/modules/rgb.py in the order
+# its view.py hands them to tunnel clusters. They are what makes a CAVER figure
+# recognisable, so they are kept verbatim. Its remaining 1000 are a long table
+# of pastels that the generator below beats on separation, so they are not.
+CAVER_PRIMARIES = [(0.0, 0.0, 1.0),    # blue
+                   (0.0, 1.0, 0.0),    # green
+                   (1.0, 0.0, 0.0),    # red
+                   (0.0, 1.0, 1.0),    # cyan
+                   (1.0, 1.0, 0.0),    # yellow
+                   (1.0, 0.0, 1.0)]    # magenta
+
+# Past the six, colours are generated rather than tabulated. The hue steps by
+# the golden angle -- an irrational fraction of the circle, so it never returns
+# to a hue it has used and consecutive steps land as far apart as the circle
+# allows -- while saturation and value cycle on 3, so neighbours differ in more
+# than hue alone. The offset keeps the early generated hues clear of the six
+# primaries: without it rank 12 lands beside blue. It was chosen by maximising
+# the smallest CIE-Lab separation over 8..24 colours, where most cases sit,
+# which holds that separation near 15 where CAVER's own table dropped to 5.
+GOLDEN_ANGLE = (3.0 - 5.0 ** 0.5) / 2.0
+HUE_OFFSET = 0.098
+SATURATION_VALUE = ((0.95, 1.00), (0.70, 1.00), (0.95, 0.72))
+
+def caverColour(rank):
+    """Name of the colour for a 0-based channel rank, registered on first use.
+
+    A pure function of the rank, with no table to run off the end of: a rank is
+    the same colour in every structure and every run, whatever was loaded
+    beside it and however many channels the case turned out to have.
+    """
+    if rank < len(CAVER_PRIMARIES):
+        name, rgb = "caver%d" % (rank + 1), CAVER_PRIMARIES[rank]
+    else:
+        step = rank - len(CAVER_PRIMARIES)
+        saturation, value = SATURATION_VALUE[step % len(SATURATION_VALUE)]
+        name = "gen%d" % rank
+        rgb = colorsys.hsv_to_rgb(
+            (HUE_OFFSET + (step + 1) * GOLDEN_ANGLE) % 1.0, saturation, value)
+    cmd.set_color(name, list(rgb))
+    return name
+
+if protein_file:
+    protein_name = os.path.splitext(os.path.basename(protein_file))[0]
+    cmd.load(protein_file, protein_name)
+    cmd.hide("everything", protein_name)
+    cmd.show("cartoon", protein_name)
+    cmd.show("surface", protein_name)
+    cmd.color("grey80", protein_name)
+    cmd.set("transparency", 0.5, protein_name)
+    print(f"Loaded protein: {protein_name}")
+else:
+    print("No protein file found in args (use: pymol vis_channels.py -- your.pdb)")
+
+# --- Load channels/tunnels ---
+def natural_sort_key(s):
+    parts = re.split(r'(\d+\.\d+|\d+)', s)
+    key = []
+    for text in parts:
+        try:
+            key.append(float(text))
+        except ValueError:
+            key.append(text.lower())
+    return key
+
+def loadSpheres(filename, colour):
+    """Show a PQR as its real probe spheres, in one colour.
+
+    The radius is read from the file text and assigned with `alter`. Do NOT use
+    `vdw=b`: PyMOL parses a .pqr extension with its PQR reader, which does not
+    put this column in the B-factor, so `vdw=b` sets every radius to zero and
+    the spheres vanish while the object is still loaded.
+    """
+    obj_name = os.path.splitext(os.path.basename(filename))[0]
+    cmd.load(filename, obj_name)
+    radii_list = []
+    with open(filename, 'r') as f:
+        for line in f:
+            if line.startswith("ATOM") or line.startswith("HETATM"):
+                radii_list.append(float(line.split()[-1]))
+    if radii_list:
+        cmd.alter(obj_name, "vdw = radii_list.pop(0)",
+                  space={'radii_list': radii_list})
+    cmd.hide("everything", obj_name)
+    cmd.show("spheres", obj_name)
+    cmd.color(colour, obj_name)
+    return obj_name
+
+# Which number in the name is the rank, tried in the order the two producers
+# write them. chl0.pqr counts from 0; CAVER writes tun_cl_001_1.pdb and colours
+# by the cluster 001, not by the trailing tunnel index within it, and numbers
+# its clusters from 1 -- so that one is shifted down to share the 0-based scale.
+RANK_PATTERNS = ((r'chl(\d+)', 0),
+                 (r'cl_(\d+)', 1),
+                 (r'(\d+)', 0))      # anything else: the first number in the name
+
+UNRANKED = "grey60"   # for a file whose name carries no number
+
+def channelRank(filename):
+    """Rank deciding the colour: the number the producer put in the file name.
+
+    Read from the name rather than from the position in the loaded list, so a
+    channel keeps its colour whether or not its lower-numbered siblings were
+    written and whatever else the glob picked up alongside it. None when the
+    name holds no number at all.
+    """
+    base = os.path.basename(filename)
+    for pattern, first in RANK_PATTERNS:
+        match = re.search(pattern, base)
+        if match:
+            return max(0, int(match.group(1)) - first)
+    return None
+
+def freeName(name):
+    """`name`, or the first numbered variant of it no loaded object has taken.
+
+    The all-channels dump written beside the per-channel files loads as an
+    object named after the set, and PyMOL refuses to make a group over a name
+    an ordinary object already holds.
+    """
+    taken = set(cmd.get_names("objects"))
+    suffix = ""
+    while name + suffix in taken:
+        suffix = str(int(suffix or 1) + 1)
+    return name + suffix
+
+# both sets read their rank off the same 0-based scale, so the first channel of
+# either program is blue and the two stay comparable side by side
+sets = [("chnl_grp", sorted(glob.glob(channel_regex), key=natural_sort_key), False),
+        ("tun_grp", sorted(glob.glob("tun_*"), key=natural_sort_key), True)]
+
+if not any(files for _, files, _ in sets):
+    print("Error: No channel files found. Check your working directory (pwd).")
+else:
+    for group, files, start_off in sets:
+        objects, unranked = [], []
+        ranks = [channelRank(f) for f in files]
+        # channels.pqr, the dump of every channel at once, sits beside the
+        # per-channel files and carries no number, so there is no rank to
+        # colour it by -- and being a copy of all of them it would hide them.
+        # Grey it and start it switched off. Unless nothing in the set has a
+        # rank, in which case the set is dumps only and position will do.
+        grey_the_unranked = any(rank is not None for rank in ranks)
+        for i, (filename, rank) in enumerate(zip(files, ranks)):
+            grey = rank is None and grey_the_unranked
+            colour = UNRANKED if grey else caverColour(i if rank is None else rank)
+            obj = loadSpheres(filename, colour)
+            objects.append(obj)
+            print(f"  {obj:<20s} {colour}{'  (no rank in name, off)' if grey else ''}")
+            if grey:
+                unranked.append(obj)
+        if objects:
+            name = freeName(group)
+            cmd.group(name, " ".join(objects))
+            if start_off:
+                cmd.disable(name)
+        for obj in unranked:          # after the group, which enables its members
+            cmd.disable(obj)
+    cmd.rebuild()
+    cmd.set("sphere_scale", 1.0)
+    cmd.set("sphere_quality", 2)
+    cmd.bg_color("white")
+    cmd.zoom()
+    print("Success: Files loaded in perfect sequential order with custom radii!")
+'''
+
+
+def _writeVisScript(directory, pattern='chl*.pqr'):
+    """Leave ``vis_channels.py`` in ``directory`` unless it is already there.
+
+    A run drops a viewer beside its PQRs, as CAVER leaves ``view.py`` beside its
+    clusters, so the output can be opened without hunting for a script. An
+    existing file is never overwritten: edits made to one run's copy survive a
+    rerun, and so does a newer script left by an earlier one.
+    """
+    import os
+
+    path = os.path.join(str(directory), 'vis_channels.py')
+    if os.path.exists(path):
+        return
+    try:
+        with open(path, 'w') as script_file:
+            script_file.write(_VIS_CHANNELS_SCRIPT)
+    except (IOError, OSError) as err:
+        # a viewer that cannot be written is no reason to lose the run
+        _warn("Could not write the PyMOL viewer {0}: {1}".format(path, err))
+    else:
+        LOGGER.info('Wrote the PyMOL viewer {0}. View the output with '
+                    '`pymol vis_channels.py -- <protein>.pdb "{1}"`.'.format(
+                        path, pattern))
