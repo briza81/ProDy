@@ -342,6 +342,89 @@ def _surfaceFromPqrWorker(args):
     return surface
 
 
+def _topologyFingerprint(atoms):
+    """A short digest of which atoms an index refers to.
+
+    Lining indices name positions in the AtomGroup a run was given, and a PQR
+    records nothing about that structure. Two frame ranges computed from
+    different structures - one solvated, one stripped - would otherwise be
+    collected together and clustered against each other, comparing atoms that
+    have nothing to do with one another, and nothing about the result would look
+    wrong. The digest is written into the file so a reader can require every
+    frame range to agree.
+
+    Built from what an index has to mean the same thing: how many atoms there are
+    and what each one is. Coordinates are left out, being what differs between the
+    frames in the first place."""
+
+    import hashlib
+
+    digest = hashlib.sha1()
+    digest.update(str(atoms.numAtoms()).encode())
+    for getter in ('getNames', 'getResnames', 'getResnums', 'getChids'):
+        values = getattr(atoms, getter)()
+        if values is not None:
+            digest.update(np.ascontiguousarray(values).tobytes())
+    return digest.hexdigest()[:16]
+
+
+def _writeMultiModelChannels(filename, frames, channels_all, atoms,
+                             trajectory=None, num_samples=5):
+    """Every frame's channels in one file, as MODEL blocks.
+
+    A file per frame is thousands of small files at ensemble scale, which is slow
+    to move between machines and awkward to keep together. One file per run holds
+    the same records.
+
+    The MODEL number is the frame number, not a counter, so the files of two
+    frame ranges concatenate into a valid whole without renumbering - which is
+    what a run split across machines produces.
+
+    The header names where the run came from, so that a fingerprint that fails to
+    match another file's says which two structures disagree. ProDy keeps no path
+    for a parsed structure, so the title is the file stem rather than the file.
+
+    The parent writes, after the workers have returned. Workers appending to a
+    shared file would need a lock and would still land in whatever order they
+    finished; here the order is the order of the frames, for free."""
+
+    header = [
+        "REMARK   channels of %d frame%s, one MODEL each\n" % (
+            len(frames), '' if len(frames) == 1 else 's'),
+        "REMARK   MODEL numbers are frame numbers, so the files of two frame\n",
+        "REMARK   ranges concatenate without renumbering\n",
+        "REMARK   topology %s  atoms %d  title %s\n" % (
+            _topologyFingerprint(atoms), atoms.numAtoms(),
+            atoms.getTitle() or 'unnamed'),
+    ]
+    # A selection shifts every index, so it belongs beside the fingerprint it
+    # changes.
+    if hasattr(atoms, 'getSelstr'):
+        header.append("REMARK   topology selection %s\n" % atoms.getSelstr())
+    if trajectory is not None:
+        source = None
+        for getter in ('getFilename', 'getTitle'):
+            if hasattr(trajectory, getter):
+                source = getattr(trajectory, getter)()
+                if source:
+                    break
+        if source:
+            header.append("REMARK   frames from %s\n" % source)
+
+    with open(str(filename), 'w') as out:
+        out.writelines(header)
+        for frame_nr, channels in zip(frames, channels_all):
+            out.write("MODEL%9d\n" % frame_nr)
+            atom_index = 1
+            for index, channel in enumerate(channels):
+                lines, count = ChannelCalculator._channelRecords(
+                    index, channel, atom_index, num_samples, 'channel',
+                    name_sites=False)
+                out.writelines(lines)
+                atom_index += count
+            out.write("ENDMDL\n")
+
+
 def _calcChannelsMultipleFramesWorker(args):
     """Compute channels. Supporting function for muliprocessing in :func:`calcChannelsMultipleFrames`."""
     frame_nr, atoms, frame_coords, frame_output_path, separate, start_point, return_details, kwargs = args
@@ -3111,11 +3194,15 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
     PDB file.
 
     This function calculates the channels for each frame in a trajectory or for
-     each model in a multi-model PDB file. The `kwargs` can include parameters 
-     necessary for channel calculation. If the `separate` parameter is set to 
-     True, each detected channel will be saved in a separate PDB file.
+     each model in a multi-model PDB file. The `kwargs` can include parameters
+     necessary for channel calculation.
 
-    :arg atoms: Atomic data or object containing atomic coordinates and methods 
+    The lining atoms of every channel are recorded here by default, unlike in
+    :func:`calcChannels`, computing frames as a set being the case where the
+    channels are afterwards matched across frames by what they touch. Pass
+    ``lining_atoms=False`` to skip the work.
+
+    :arg atoms: Atomic data or object containing atomic coordinates and methods
         for accessing them.
     :type atoms: object
 
@@ -3129,11 +3216,21 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         results are not saved. Default is None.
     :type output_path: str or None
 
-    :arg separate: If True, each detected channel is saved to a separate PDB 
-        file for each frame/model.
-        If False, all channels for each frame/model are saved in a single file. 
-        Default is False.
+    :arg separate: Not supported here, and raises when True. One file per channel
+        per frame is thousands of files for a trajectory of any length. For
+        per-object output at this scale, cluster the channels and take the
+        per-cluster files. Kept in the signature so the refusal is explicit
+        rather than a silent change in what a script writes.
     :type separate: bool
+
+    :arg multimodel: If True, every frame's channels are written to a single file
+        as MODEL blocks, instead of one file per frame. The MODEL number is the
+        frame number, so the files of two frame ranges - a run split across
+        machines - concatenate without renumbering. Requires ``start_point``,
+        since channels are comparable across frames only when every frame was
+        traced from the same site. Default is False, so existing per-frame
+        scripts are unaffected.
+    :type multimodel: bool
 
     :arg start_point: Optional starting point for channel search, applied to every
         frame. If provided, the search is restricted to the cavity holding the
@@ -3173,9 +3270,16 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
                                     output_path="channels.pdb", separate=False, surf_radius=15,
                                     inner_radius=1.2, min_depth=5, bottleneck=1, sparsity=6)
                                   
-    channels_all, surfaces_all = calcChannelsMultipleFrames(atoms, trajectory=traj, 
-                                    output_path="channels.pdb", separate=False, 
-                                    start_point=[-10.353, -0.133, 5.608]) """
+    channels_all, surfaces_all = calcChannelsMultipleFrames(atoms, trajectory=traj,
+                                    output_path="channels.pdb", separate=False,
+                                    start_point=[-10.353, -0.133, 5.608])
+
+    One file for the whole run, and one frame range of a run split across
+    machines:
+    channels_all, surfaces_all = calcChannelsMultipleFrames(atoms, trajectory=traj,
+                                    output_path="channels.pqr", multimodel=True,
+                                    start_point=[-10.353, -0.133, 5.608],
+                                    start_frame=500, stop_frame=999) """
     
     if PY3K:
         if not checkAndImport('pathlib'):
@@ -3200,10 +3304,43 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
     return_details = kwargs.pop('return_details', False)
     start_frame = kwargs.pop('start_frame', 0)
     stop_frame = kwargs.pop('stop_frame', -1)
-    
+    multimodel = kwargs.pop('multimodel', False)
+
+    # A file per object across an ensemble is frames times channels, which runs
+    # into the tens of thousands for a trajectory of any length: unusable as a
+    # directory and never what the caller meant. The per-cluster files written by
+    # the clustering are the per-object output that makes sense at this scale.
+    if separate:
+        raise ValueError('separate=True is not supported by '
+                         'calcChannelsMultipleFrames: it writes one file per '
+                         'channel per frame, so this run would produce a file '
+                         'for each of the channels found in each of its frames. '
+                         'Use separate=False, or multimodel=True for a single '
+                         'file, and take per-object output from the clustering '
+                         'instead.')
+
+    # The lining is what one frame's channel is recognised by in the next, and
+    # clustering is the reason to compute frames as a set, so it is on here even
+    # though calcChannels leaves it off.
+    kwargs.setdefault('lining_atoms', True)
+
+    if multimodel and start_point is None:
+        raise ValueError('multimodel=True requires start_point. Channels are '
+                         'comparable across frames only when they were all '
+                         'traced from the same site, and without a start point '
+                         'each frame is seeded from whatever voids it happens to '
+                         'have, in an order that follows their volumes.')
+
     if output_path:
         output_path = Path(output_path)
-        if output_path.suffix == ".pqr":
+        if multimodel:
+            # One file, so the path names that file rather than a stem the
+            # per-frame names are built from.
+            if output_path.is_dir():
+                output_path = output_path / "channels.pqr"
+            elif output_path.suffix not in ('.pqr', '.pdb'):
+                output_path = output_path.with_suffix('.pqr')
+        elif output_path.suffix == ".pqr":
             output_path = output_path.with_suffix('')
 
     if trajectory is not None:
@@ -3220,7 +3357,9 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         
         atoms_copy = atoms.copy()
         for j0, frame0 in enumerate(traj, start=start_frame):
-            if output_path:
+            # Nothing is written per frame under multimodel: the parent writes
+            # every frame into one file once the workers have returned.
+            if output_path and not multimodel:
                 frame_output_path = _frameOutputPath(output_path, j0, "channels")
             else:
                 frame_output_path = None
@@ -3235,7 +3374,7 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
             for i in range(len(atoms.getCoordsets()[start_frame:stop_frame])):
                 model_nr = i + start_frame
 
-                if output_path:
+                if output_path and not multimodel:
                     frame_output_path = _frameOutputPath(output_path, model_nr,
                                                          "channels")
                 else:
@@ -3281,13 +3420,22 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         channels_all.append(channels)
         surfaces_all.append(surfaces)
 
+    if multimodel and output_path:
+        LOGGER.timeit('_prody_channels_multimodel')
+        _writeMultiModelChannels(output_path, [task[0] for task in tasks],
+                                 channels_all, atoms, trajectory)
+        LOGGER.report("Wrote {0} frames of channels to {1} in %.2fs.".format(
+            len(tasks), output_path), '_prody_channels_multimodel')
+        LOGGER.info("Channels of {0} frames written to {1}.".format(
+            len(tasks), output_path))
+
     if return_details:
         return channels_all, surfaces_all, details_all
 
     return channels_all, surfaces_all
 
 
-def calcSurfaceCavitiesMultipleFrames(atoms, trajectory=None, output_path=None, 
+def calcSurfaceCavitiesMultipleFrames(atoms, trajectory=None, output_path=None,
     separate=False, max_proc=2, mp_context=None, **kwargs):
     """Compute surface cavities for each frame in a trajectory or multi-model PDB.
 
@@ -8429,6 +8577,8 @@ class ChannelCalculator:
         # separable at the record level, matching saveCavitiesToPdb.
         lines = [ChannelCalculator._channelRemark(channel_index, channel, label,
                                                   name_sites)]
+        lines.extend(ChannelCalculator._channelLiningRemarks(channel_index,
+                                                             channel, label))
         for i, (x, y, z, radius) in enumerate(zip(centers[:, 0], centers[:, 1],
                                                   centers[:, 2], radii),
                                               start=atom_index):
@@ -8522,6 +8672,41 @@ class ChannelCalculator:
                 "curvature=%s  cost=%s%s\n" % (
                     label, channel_index, channel.length, channel.bottleneck,
                     curv, cost, where))
+
+    @staticmethod
+    def _channelLiningRemarks(channel_index, channel, label='channel', width=79):
+        """The REMARK lines holding a channel's lining atoms, empty when it has none.
+
+        The indices go into the file because the spheres do not imply them: they
+        are a property of the structure the run was given, and a run split across
+        machines comes back as files. Written as REMARKs so one file still holds
+        everything about a channel and concatenating the files of two frame ranges
+        stays a valid merge.
+
+        The indices are into the AtomGroup of that run, which the file does not
+        carry, so a reader has to be handed the same structure.
+
+        A count line first, then the indices wrapped to *width* columns. Only the
+        atoms a channel actually touches are listed, so the lines cost a few per
+        cent of the sphere records they sit above."""
+
+        lining = getattr(channel, 'lining', None)
+        if lining is None:
+            return []
+
+        head = "REMARK   %s %d  lining" % (label, channel_index)
+        lines = ["%s pad=%.2f natoms=%d\n" % (head, channel.lining_pad,
+                                              len(lining))]
+        row = head
+        for index in lining:
+            token = " %d" % index
+            if len(row) + len(token) > width:
+                lines.append(row + "\n")
+                row = head
+            row += token
+        if row != head:
+            lines.append(row + "\n")
+        return lines
 
 
     @staticmethod
