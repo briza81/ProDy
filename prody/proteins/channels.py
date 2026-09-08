@@ -39,7 +39,8 @@ __all__ =['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames',
            'getLinkParameters', 'getLinkResidueNames',
            'getLinkParametersMultipleFrames', 'getLinkResidueNamesMultipleFrames',
            'scanSurfaceCavityParameters', 'connectChannelsToSurfaceCavities',
-           'calcFrequentObjectResidues', 'showFrequentObjectResidues']
+           'calcFrequentObjectResidues', 'showFrequentObjectResidues',
+           'calcChannelClusters', 'getChannelClusterLabels']
 
 # Van der Waals radii in Angstrom, by element symbol (upper case). The radii the
 # tessellation is built on, and the ones the lining report measures a Voronoi
@@ -3433,6 +3434,831 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         return channels_all, surfaces_all, details_all
 
     return channels_all, surfaces_all
+
+
+def _resampleByArclength(points, radii, h):
+    """*h* points at equal fractions of the route's own length.
+
+    Not :func:`_sampleObjectSpheres`, which is even in the spline parameter. That
+    parameter runs on the square root of the step between circumcenters, so its
+    samples are only roughly even along the route and their spacing follows how the
+    tessellation happened to fall. Two channels compared point against point have
+    to be cut at the same fractions of their own lengths, or the comparison reads a
+    difference in sampling as a difference in route."""
+
+    points = np.asarray(points, dtype=float)
+    radii = np.asarray(radii, dtype=float)
+
+    steps = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    walked = np.concatenate([[0.0], np.cumsum(steps)])
+    if walked[-1] <= 0:
+        return np.repeat(points[:1], h, axis=0), np.repeat(radii[:1], h)
+
+    at = np.linspace(0.0, walked[-1], h)
+    resampled = np.stack([np.interp(at, walked, points[:, k])
+                          for k in range(3)], axis=1)
+    return resampled, np.interp(at, walked, radii)
+
+
+def _channelSamples(channel, num_samples=5):
+    """``(centres, radii)`` of a channel, in memory or read back from a file.
+
+    A :class:`Channel` still holds its splines and is sampled from them. A channel
+    parsed out of a written run carries the samples themselves, which came from
+    those same splines."""
+
+    points = getattr(channel, 'points', None)
+    if points is not None:
+        return points, channel.radii
+    return _sampleObjectSpheres(channel, num_samples)
+
+
+def _condensedIndex(i, j, n):
+    """Where pair ``(i, j)``, ``i < j``, sits in a condensed distance vector."""
+
+    return i * n - (i * (i + 1)) // 2 + (j - i - 1)
+
+
+def _rowBands(n, count):
+    """*count* row bands of a condensed matrix holding roughly equal work.
+
+    Row *i* contributes ``n - i - 1`` pairs, so equal row counts would leave the
+    first worker with most of the matrix. The bands are cut on the cumulative pair
+    count instead. Each is a contiguous span of the condensed vector, so a worker
+    fills its own slice and the parent concatenates them in order."""
+
+    pairs = np.arange(n - 1, -1, -1, dtype=np.int64)
+    edges = np.searchsorted(np.cumsum(pairs),
+                            np.linspace(0, int(pairs.sum()), count + 1)[1:])
+    bands, start = [], 0
+    for edge in edges:
+        stop = min(int(edge) + 1, n)
+        if stop > start:
+            bands.append((start, stop))
+            start = stop
+    if start < n:
+        bands.append((start, n))
+    return bands
+
+
+def _centerlineDistances(samples, h):
+    """L1 between ``(3h + h)`` embeddings, divided by *h*.
+
+    CAVER's shape of distance: h points and their h radii laid end to end and
+    compared coordinate by coordinate. Dividing by h makes the result a mean over
+    the sampled points rather than a sum, so it stays on the scale of an Angstrom
+    however finely the route is cut. The radius rides in the same vector as the
+    coordinates, so a route that runs where another does but at half the width is
+    not called the same route."""
+
+    from scipy.spatial.distance import pdist
+
+    embedding = np.array([np.concatenate([points.ravel(), radii])
+                          for points, radii in samples], dtype=float)
+    return pdist(embedding, 'cityblock') / float(h)
+
+
+def _surfaceBand(args):
+    """One band of rows of the surface-gap matrix. Top level so a Pool can pickle it."""
+
+    start, stop, points, squares, radii, h, n = args
+
+    try:
+        from threadpoolctl import threadpool_limits
+    except ImportError:
+        threadpool_limits = None
+
+    def _fill():
+        out = np.empty(sum(n - row - 1 for row in range(start, stop)),
+                       dtype=np.float64)
+        at = 0
+        for a in range(start, stop, 16):
+            b = min(a + 16, stop)
+            # |x - y|^2 = |x|^2 + |y|^2 - 2 x.y, one dgemm per block, and only
+            # against j >= a so the lower triangle is never computed.
+            gaps = (squares[a * h:b * h, None] + squares[None, a * h:]
+                    - 2.0 * (points[a * h:b * h] @ points[a * h:].T))
+            np.maximum(gaps, 0.0, out=gaps)          # rounding can dip below 0
+            np.sqrt(gaps, out=gaps)
+            gaps -= radii[a * h:b * h, None]
+            gaps -= radii[None, a * h:]
+            # What makes this a surface gap rather than a centre distance: two
+            # spheres that overlap are zero apart, not a negative amount apart.
+            # Clipping here rather than after the min is the same answer, since
+            # min_j max(0, d) == max(0, min_j d).
+            np.maximum(gaps, 0.0, out=gaps)
+            block = gaps.reshape(b - a, h, n - a, h)
+            # Nearest point on the other route, averaged along this one, then the
+            # same the other way round: the relation is not symmetric on its own,
+            # and a distance has to be.
+            both = (block.min(axis=3).mean(axis=1)
+                    + block.min(axis=1).mean(axis=2)) / 2.0
+            for row in range(a, b):
+                width = n - row - 1
+                out[at:at + width] = both[row - a, row - a + 1:]
+                at += width
+        return out
+
+    if threadpool_limits is None:
+        return _fill()
+    # One BLAS thread per worker. The blocks are small, and threading them fights
+    # the process-level parallelism this function is already inside of; measured
+    # several times faster pinned. threadpoolctl is not a ProDy dependency, so
+    # its absence only costs speed.
+    with threadpool_limits(limits=1, user_api='blas'):
+        return _fill()
+
+
+def _surfaceDistances(samples, h, max_proc=1, mp_context=None):
+    """Mean clipped gap between the surfaces of two routes, averaged both ways.
+
+    Every point of one route is measured to the nearest point of the other, taking
+    the radii off both so that what is measured is the space between the tubes and
+    not between their centrelines. Overlapping tubes read zero, so routes that run
+    through one another are not separated by how far their centres wander."""
+
+    n = len(samples)
+    points = np.ascontiguousarray(
+        np.array([s[0] for s in samples], dtype=float).reshape(n * h, 3))
+    radii = np.ascontiguousarray(
+        np.array([s[1] for s in samples], dtype=float).reshape(n * h))
+    squares = (points * points).sum(axis=1)
+
+    if max_proc == 1:
+        return _surfaceBand((0, n, points, squares, radii, h, n))
+
+    tasks = [(start, stop, points, squares, radii, h, n)
+             for start, stop in _rowBands(n, max_proc)]
+
+    import multiprocessing
+
+    if mp_context is None:
+        ctx = multiprocessing.get_context()
+    else:
+        ctx = multiprocessing.get_context(mp_context)
+    with ctx.Pool(processes=len(tasks)) as pool:
+        return np.concatenate(pool.map(_surfaceBand, tasks))
+
+
+def _liningDistances(sets, df_max=0.40):
+    """Jaccard distance between lining-atom sets, over a document-frequency filter.
+
+    An atom that lines nearly every channel says nothing about which channel this
+    is, and there are enough of them - the walls of the one cavity every route runs
+    out of - to dominate an intersection. Dropping the atoms above *df_max* leaves
+    those that tell routes apart, which is why a document comparison drops its
+    stopwords.
+
+    Intersections come from the membership matrix times its own transpose. float32
+    is exact here: the entries are counts of shared atoms, small integers. Threaded
+    BLAS is left alone, unlike in :func:`_surfaceBand` - this is one large product,
+    which the library threads better than processes can, and pinning it measured
+    almost three times slower. The inconsistency is deliberate."""
+
+    n = len(sets)
+    present = [np.asarray(s, dtype=int) for s in sets]
+    if not any(len(s) for s in present):
+        _warn("no channel carries any lining atom, so every distance is 1.0 and "
+              "the clustering has nothing to go on.")
+        return np.ones(n * (n - 1) // 2, dtype=np.float64)
+
+    universe = np.unique(np.concatenate([s for s in present if len(s)]))
+    membership = np.zeros((n, len(universe)), dtype=np.float32)
+    for row, atoms in enumerate(present):
+        if len(atoms):
+            membership[row, np.searchsorted(universe, atoms)] = 1.0
+
+    if n < 50:
+        # How often an atom appears among a handful of channels estimates nothing,
+        # and the filter would empty most of the sets.
+        _warn("{0} channels is too few to judge how common a lining atom is, so "
+              "the df_max={1} filter was skipped.".format(n, df_max))
+    else:
+        keep = membership.mean(axis=0) < df_max
+        if not keep.any():
+            _warn("every lining atom lines at least {0:.0%} of the channels, so "
+                  "the df_max filter was skipped.".format(df_max))
+        else:
+            membership = np.ascontiguousarray(membership[:, keep])
+
+    sizes = membership.sum(axis=1)
+    out = np.empty(n * (n - 1) // 2, dtype=np.float64)
+    at = 0
+    for a in range(0, n, 512):
+        b = min(a + 512, n)
+        shared = membership[a:b] @ membership[a:].T
+        union = sizes[a:b, None] + sizes[None, a:] - shared
+        # Two sets that the filter emptied share nothing and cover nothing. 1.0
+        # holds them apart from everything, where 0/0 would put NaN in the matrix
+        # and take the linkage with it.
+        block = 1.0 - shared / np.maximum(union, 1e-9)
+        for row in range(a, b):
+            width = n - row - 1
+            out[at:at + width] = block[row - a, row - a + 1:]
+            at += width
+    return out
+
+
+class _FileChannel(object):
+    """A channel read back from a written run: what clustering needs, no more.
+
+    Enough of :class:`Channel` to be clustered and reported on - the spheres along
+    the route, the lining, and the geometry off the REMARK - and none of what would
+    need the tessellation that is no longer there. The splines are not rebuilt: the
+    written spheres are the samples every consumer here asks for, and they were
+    written from those same splines."""
+
+    def __init__(self, points, radii, frame, index):
+        self.points = np.asarray(points, dtype=float)
+        self.radii = np.asarray(radii, dtype=float)
+        self.frame = frame
+        self.index = index
+        self.lining = None
+        self.lining_pad = None
+        self.length = float('nan')
+        self.bottleneck = float('nan')
+        self.curvature = float('nan')
+        self.cost = None
+        # One site is a precondition of clustering, and a written run cannot say
+        # which of several it came from, having dropped the sp tags when it had
+        # only one to name. Anything read back is treated as that one site.
+        self.origin = 0
+
+
+def _resolvePqrFiles(pqr_files):
+    """The convention :func:`calcChannelSurfaceOverlaps` already uses for this.
+
+    ``False`` or ``None`` scans the working directory, a string names a folder,
+    and a list names the files."""
+
+    import os
+
+    if pqr_files is False or pqr_files is None:
+        return sorted(f for f in os.listdir('.') if f.endswith('.pqr'))
+    if isinstance(pqr_files, str):
+        if os.path.isdir(pqr_files):
+            return sorted(os.path.join(pqr_files, f)
+                          for f in os.listdir(pqr_files) if f.endswith('.pqr'))
+        return [pqr_files]
+    if isinstance(pqr_files, (list, tuple)):
+        return [str(f) for f in pqr_files]
+    raise ValueError('pqr_files must be a list of files, a folder path, or '
+                     'nothing to read the .pqr files of the current folder; '
+                     'got {0!r}'.format(type(pqr_files).__name__))
+
+
+def _readChannelFiles(pqr_files):
+    """Channels of a written run, by frame, as :class:`_FileChannel` objects.
+
+    Read as text rather than through :func:`~.parsePQR`, for two reasons that both
+    matter here: that parser ignores MODEL records for a PQR, so every frame would
+    arrive as one heap of atoms, and it drops REMARKs, which is where the lining
+    and the geometry are. What it would give back - coordinates and radii with no
+    way to tell one channel from the next - is the part that is cheapest to read.
+
+    The frame is the MODEL number, and where a file has none it is the trailing
+    number of the file name, which is how the per-frame writer names them.
+
+    Topology fingerprints are compared across the files rather than against a
+    structure: what matters is that the frame ranges being clustered together came
+    from one structure, and the digest says that without anything else present."""
+
+    import os
+    import re
+
+    frames, fingerprints, titles, seen = {}, {}, {}, {}
+    for path in _resolvePqrFiles(pqr_files):
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            _warn("skipping empty or missing file {0}.".format(path))
+            continue
+
+        tail = re.search(r'(\d+)\s*$', os.path.splitext(os.path.basename(path))[0])
+        frame = int(tail.group(1)) if tail else 0
+        here = {}
+
+        def _flush(here, frame):
+            """Close off one model: its channels are numbered from 0 again."""
+            for index in sorted(here):
+                record = here[index]
+                if not record.get('xyz'):
+                    continue
+                channel = _FileChannel(record['xyz'], record['r'], frame, index)
+                if record.get('natoms') is not None:
+                    channel.lining = np.array(sorted(record['lining']), dtype=int)
+                    channel.lining_pad = float(record.get('pad', 'nan'))
+                    if len(channel.lining) != int(record['natoms']):
+                        raise ValueError(
+                            '{0}: channel {1} of frame {2} says it lists {3} '
+                            'lining atoms but {4} were read. The file is '
+                            'truncated or its REMARK lines were reflowed.'.format(
+                                path, index, frame, record['natoms'],
+                                len(channel.lining)))
+                for key, attribute in (('length', 'length'),
+                                       ('bottleneck', 'bottleneck'),
+                                       ('curvature', 'curvature'),
+                                       ('cost', 'cost')):
+                    value = record.get(key)
+                    if value not in (None, 'n/a'):
+                        setattr(channel, attribute, float(value))
+                if record.get('origin') is not None:
+                    channel.origin = record['origin']
+                # A frame range collected twice - the per-chunk files beside the
+                # file they were merged into - would otherwise double every
+                # channel, and a duplicate of a route is its own nearest
+                # neighbour, so nothing downstream would look wrong.
+                if (frame, index) in seen:
+                    raise ValueError(
+                        'channel {0} of frame {1} is in both {2} and {3}. The '
+                        'same frames are being read twice, so every one of them '
+                        'would be clustered against a copy of itself.'.format(
+                            index, frame, seen[(frame, index)], path))
+                seen[(frame, index)] = path
+                frames.setdefault(frame, []).append(channel)
+
+        with open(path) as handle:
+            for line in handle:
+                if line.startswith('MODEL'):
+                    _flush(here, frame)
+                    here = {}
+                    frame = int(line[5:].strip() or 0)
+                    continue
+                if line.startswith('REMARK'):
+                    fields = line.split()
+                    if len(fields) > 2 and fields[1] == 'topology':
+                        if fields[2] == 'selection':
+                            continue
+                        fingerprints.setdefault(fields[2], []).append(path)
+                        if 'title' in fields:
+                            titles[fields[2]] = fields[fields.index('title') + 1]
+                        continue
+                    if len(fields) > 2 and fields[1] == 'channel':
+                        index = int(fields[2])
+                        record = here.setdefault(index, {'lining': []})
+                        for position, field in enumerate(fields[3:], start=3):
+                            if field.startswith('lining'):
+                                continue
+                            if '=' in field:
+                                key, _, value = field.partition('=')
+                                record[key] = value
+                            elif field.isdigit():
+                                record['lining'].append(int(field))
+                            elif field == 'from' and position + 1 < len(fields):
+                                # "from sp3": the search site, written only by a
+                                # run that had more than one to tell apart.
+                                record['origin'] = int(fields[position + 1][2:])
+                    continue
+                if line.startswith('ATOM') and line[17:20] == 'FIL':
+                    # Fixed columns: three %8.3f coordinates can run together
+                    # without a space once one of them reaches -100.
+                    index = int(line[22:26]) - 1
+                    record = here.setdefault(index, {'lining': []})
+                    record.setdefault('xyz', []).append(
+                        (float(line[30:38]), float(line[38:46]),
+                         float(line[46:54])))
+                    record.setdefault('r', []).append(float(line[60:66]))
+
+        _flush(here, frame)
+
+    if len(fingerprints) > 1:
+        raise ValueError(
+            'the files do not come from one structure, so their atom indices do '
+            'not name the same atoms and cannot be compared: {0}. Cluster each '
+            'set separately, or recompute them from one structure.'.format(
+                '; '.join('{0} ({1}) in {2} file(s)'.format(
+                    digest, titles.get(digest, 'no title'), len(paths))
+                    for digest, paths in sorted(fingerprints.items()))))
+
+    if not frames:
+        raise ValueError('no channels were read. Files written by calcChannels '
+                         'hold their routes as FIL records; pqr_files={0!r} '
+                         'matched none.'.format(pqr_files))
+
+    return [frames[frame] for frame in sorted(frames)], sorted(frames)
+
+
+def _channelClusterDistances(channels, method, h, max_proc, mp_context, df_max):
+    """The condensed distance vector of one method, and what it is measured in."""
+
+    if method == 'lining_atoms':
+        pads = {channel.lining_pad for channel in channels}
+        missing = sum(getattr(channel, 'lining', None) is None
+                      for channel in channels)
+        if missing:
+            raise ValueError(
+                "{0} of {1} channels carry no lining, so they cannot be compared "
+                "by it. Recompute with calcChannels(lining_atoms=True), which "
+                "calcChannelsMultipleFrames does by default, or cluster by "
+                "method='centerline' or 'surface', which read the route "
+                "itself.".format(missing, len(channels)))
+        if len(pads) > 1:
+            raise ValueError(
+                "the channels were gathered at more than one lining_pad ({0}), so "
+                "their sets are not on one footing and a distance between them "
+                "would mean nothing. Recompute them at a single "
+                "pad.".format(', '.join('%.2f' % p for p in sorted(pads))))
+        return _liningDistances([channel.lining for channel in channels],
+                                df_max), 'Jaccard'
+
+    samples = [_resampleByArclength(*_channelSamples(channel), h=h)
+               for channel in channels]
+    if method == 'centerline':
+        return _centerlineDistances(samples, h), 'A'
+    return _surfaceDistances(samples, h, max_proc, mp_context), 'A'
+
+
+def _canonicalClusterLabels(flat, channels, index):
+    """Renumber clusters so the same partition always comes out the same way.
+
+    scipy numbers a cluster by where its members happen to sit in the input, so
+    the same channels in a different frame order come back with the labels
+    shuffled, and two runs cannot be compared by eye or by test. Ordered by how
+    many channels a cluster holds, then by mean bottleneck, then by the earliest
+    channel in it, which no permutation of the input can change.
+
+    0-based, where scipy's fcluster is 1-based, so a cluster number means the
+    same thing as every other index in this module."""
+
+    bottlenecks = np.array([channel.bottleneck for channel in channels],
+                           dtype=float)
+    order = []
+    for label in np.unique(flat):
+        members = np.flatnonzero(flat == label)
+        widths = bottlenecks[members]
+        mean_width = (np.nanmean(widths)
+                      if not np.all(np.isnan(widths)) else -np.inf)
+        order.append((-len(members), -mean_width,
+                      min(index[m] for m in members), label))
+    order.sort()
+
+    renumbered = np.empty(len(flat), dtype=int)
+    for new, (_, _, _, label) in enumerate(order):
+        renumbered[flat == label] = new
+    return renumbered
+
+
+def _reportClusterMemory(n, max_proc):
+    """Say what the distance matrix will cost, and warn if the machine is short.
+
+    Never a ceiling: a machine with plenty of memory should not be refused
+    because of a number written into this file, and a run that is going to be
+    tight is better told so while it can still be made smaller."""
+
+    import os
+
+    condensed = n * (n - 1) // 2 * 8
+    # linkage copies its input, so the peak is about twice the vector, plus one
+    # block per worker.
+    peak = 2.0 * condensed
+    LOGGER.info("{0} channels: {1:,} pairs, {2:.2f} GB for the distances and "
+                "about {3:.2f} GB at the peak.".format(
+                    n, n * (n - 1) // 2, condensed / 2.0 ** 30, peak / 2.0 ** 30))
+
+    available = None
+    try:
+        with open('/proc/meminfo') as handle:
+            for line in handle:
+                if line.startswith('MemAvailable:'):
+                    available = int(line.split()[1]) * 1024
+                    break
+    except (IOError, OSError):
+        pass
+    if available is None:
+        try:
+            available = (os.sysconf('SC_PAGE_SIZE')
+                         * os.sysconf('SC_AVPHYS_PAGES'))
+        except (ValueError, AttributeError, OSError):
+            available = None
+
+    if available is None:
+        LOGGER.info("This machine's free memory could not be read, so the "
+                    "projection above is not checked against it.")
+    elif peak > 0.5 * available:
+        _warn("the distances need about {0:.2f} GB at the peak and about "
+              "{1:.2f} GB is free. Each parallel worker holds a block of its "
+              "own, so a lower max_proc than {2} costs time and saves memory; "
+              "so does clustering fewer frames, consecutive frames of a "
+              "trajectory being much alike anyway.".format(
+                  peak / 2.0 ** 30, available / 2.0 ** 30, max_proc))
+
+
+def calcChannelClusters(pqr_files=None, method='centerline', cutoff=None,
+                        percentile=None, linkage_method=None,
+                        max_proc=2, mp_context=None, return_details=False,
+                        **kwargs):
+    """Group the channels of many frames into the routes they are frames of.
+
+    :func:`calcChannelsMultipleFrames` finds channels frame by frame, and nothing
+    says that channel 2 of frame 3 and channel 5 of frame 400 are the same route
+    seen twice. This groups them, by hierarchical clustering over a pairwise
+    distance between channels, so that a route can be counted, averaged and
+    followed through the trajectory.
+
+    There is no single-frame counterpart and so no ``MultipleFrames`` suffix:
+    clustering only means anything across frames.
+
+    Three distances, which fail differently, so a route all three separate is a
+    firmer result than one only the cheapest does:
+
+    ``'centerline'``
+        The route as h points and h radii, compared coordinate by coordinate
+        (L1). Cheapest by an order of magnitude, and the default.
+    ``'surface'``
+        The mean gap between the two tubes' surfaces, each point measured to the
+        nearest point of the other route with both radii taken off, and clipped
+        at zero so overlapping routes read zero. Sees width where
+        ``'centerline'`` sees position.
+    ``'lining_atoms'``
+        Jaccard distance between the sets of atoms the routes touch, needing
+        ``channel.lining`` from ``calcChannels(lining_atoms=True)``. The only one
+        of the three that does not read coordinates, so the only one that
+        survives frames that were never aligned.
+
+    :arg pqr_files: The channels to cluster, as written by
+        :func:`calcChannelsMultipleFrames`: a list of paths, a folder, or None
+        for the ``.pqr`` files of the working directory. Frame ranges written by
+        separate jobs may be given together and are read as one set; they are
+        refused if they came from different structures, or if the same frames
+        appear twice.
+    :type pqr_files: list, str or None
+
+    :arg method: ``'centerline'``, ``'surface'`` or ``'lining_atoms'``.
+    :type method: str
+
+    :arg cutoff: Distance below which two channels are one route, in Angstroms
+        for ``'centerline'`` and ``'surface'`` and as a Jaccard distance for
+        ``'lining_atoms'``. Mutually exclusive with *percentile*. Pin it to
+        compare one run against another.
+    :type cutoff: float or None
+
+    :arg percentile: Cut where this percentage of all pairwise distances falls
+        below, instead of at a fixed distance. Warned about on every use: a
+        percentile is a property of the set it is measured on, so adding frames
+        moves it. Defaults to 5 for ``'centerline'`` and ``'surface'`` and 3 for
+        ``'lining_atoms'`` when neither this nor *cutoff* is given.
+    :type percentile: float or None
+
+    :arg linkage_method: ``'complete'`` (the default for the two geometric
+        methods), ``'average'`` (for ``'lining_atoms'``) or ``'weighted'``.
+        ``'single'`` is refused for chaining whole clusters together through one
+        near pair; ``'ward'``, ``'centroid'`` and ``'median'`` are refused
+        because they need Euclidean coordinates, which none of these distances
+        are, and because their merge heights are not distances, so a cutoff on
+        the distance scale would not mean anything.
+    :type linkage_method: str or None
+
+    :arg max_proc: Processes used for the ``'surface'`` distance, which is the
+        only one worth parallelising. If None, all cores. Default is 2.
+    :type max_proc: int or None
+
+    :arg return_details: Also return a dict holding the linkage matrix ``Z``, the
+        resolved ``cutoff``, the flat-to-frame ``index``, cluster ``sizes`` and
+        distance ``quantiles``. :func:`getChannelClusterLabels` re-cuts it in
+        milliseconds, the distances being the expensive part.
+    :type return_details: bool
+
+    :arg h: Points each route is resampled to, for the two geometric methods.
+        Default is 10, which is what the cutoffs were calibrated at.
+    :type h: int
+
+    :arg df_max: For ``'lining_atoms'``: atoms lining more than this fraction of
+        all channels are dropped before comparing, being the walls of the cavity
+        every route runs out of rather than anything that tells routes apart.
+        Default is 0.40.
+    :type df_max: float
+
+    :returns: ``labels_all``, one integer array per frame in frame order,
+        numbered from 0, cluster 0 holding the most channels. With
+        ``return_details=True``, also the details dict.
+    :rtype: list of ndarray, or tuple
+
+    The channels are read from the files rather than taken as objects, as
+    :func:`calcChannelSurfaceOverlaps` and :func:`calcSurfaceCavityOverlaps` also
+    do, and for the same reason: this compares every channel against every other,
+    which is the point at which a run is a set of written results rather than
+    something in hand. It also fixes the order they are compared in - frame, then
+    channel - so a run split across machines gives the same answer however the
+    pieces are collected.
+
+    Example usage:
+    calcChannelsMultipleFrames(atoms, trajectory=traj, output_path='run.pqr',
+                               multimodel=True,
+                               start_point=[-10.353, -0.133, 5.608])
+    labels_all = calcChannelClusters('run.pqr')
+
+    Frame ranges from separate jobs, cut twice without measuring twice:
+    labels_all, details = calcChannelClusters('./chunks',
+                                    method='lining_atoms', return_details=True)
+    tighter = getChannelClusterLabels(details, cutoff=0.45)
+    """
+
+    from scipy.cluster.hierarchy import linkage, fcluster
+
+    # Each method's linkage and default percentile. The linkage is the one it was
+    # calibrated with; the percentile is deliberately below the value that best
+    # reproduced a reference clustering, so that the default errs towards keeping
+    # distinct routes apart rather than merging them, and a merge is something the
+    # user asks for by raising it.
+    settings = {'centerline': ('complete', 5.0),
+                'surface': ('complete', 5.0),
+                'lining_atoms': ('average', 3.0)}
+    if method not in settings:
+        raise ValueError("method must be 'centerline', 'surface' or "
+                         "'lining_atoms', got {0!r}".format(method))
+    calibrated, default_percentile = settings[method]
+
+    # Linkages whose merge heights are on the scale of the distances, minus the
+    # one that joins two clusters on their single closest pair.
+    if linkage_method is None:
+        linkage_method = calibrated
+    elif linkage_method in ('ward', 'centroid', 'median'):
+        raise ValueError(
+            "linkage_method={0!r} needs Euclidean coordinates, and these are "
+            "distances between routes, not points in a space. Its merge heights "
+            "are also not distances, so cutoff and percentile would not mean "
+            "what they say. Use 'complete', 'average' or "
+            "'weighted'.".format(linkage_method))
+    elif linkage_method == 'single':
+        raise ValueError(
+            "linkage_method='single' joins two clusters on their one closest "
+            "pair, so a single pair of channels that happen to pass near each "
+            "other chains two routes into one. Use 'complete', 'average' or "
+            "'weighted'.")
+    elif linkage_method not in ('complete', 'average', 'weighted'):
+        raise ValueError("linkage_method must be 'complete', 'average' or "
+                         "'weighted', got {0!r}".format(linkage_method))
+    elif linkage_method != calibrated:
+        _warn("method={0!r} was calibrated with linkage_method={1!r}, and the "
+              "default cutoff follows from that pairing. With {2!r} the default "
+              "is not calibrated; pass cutoff= from your own "
+              "inspection.".format(method, calibrated, linkage_method))
+
+    if cutoff is not None and percentile is not None:
+        raise ValueError('give cutoff or percentile, not both: one names a '
+                         'distance and the other asks for one to be found.')
+
+    h = kwargs.pop('h', 10)
+    df_max = kwargs.pop('df_max', 0.40)
+    if kwargs:
+        raise TypeError('calcChannelClusters() got an unexpected keyword '
+                        'argument {0}.'.format(
+                            ', '.join(repr(k) for k in sorted(kwargs))))
+
+    channels_all, frame_numbers = _readChannelFiles(pqr_files)
+    LOGGER.info("Read {0} channels from {1} frame{2}.".format(
+        sum(len(f) for f in channels_all), len(frame_numbers),
+        '' if len(frame_numbers) == 1 else 's'))
+
+    # One flat list, remembering which frame and which position each came from.
+    channels, index = [], []
+    for position, frame in enumerate(channels_all):
+        for slot, channel in enumerate(frame):
+            channels.append(channel)
+            index.append((position, slot))
+    n = len(channels)
+    if n < 2:
+        raise ValueError('{0} channel(s) in all: there is nothing to '
+                         'cluster.'.format(n))
+
+    # Channels traced from different sites do not share a landmark at point 0, so
+    # the two geometric distances would be measuring between the sites rather
+    # than between the routes. A run given a start_point has one site and writes
+    # no site tag; one that found several writes "from sp<n>" on every channel,
+    # which is what is being counted here.
+    origins = {getattr(channel, 'origin', None) for channel in channels}
+    origins.discard(None)
+    if len(origins) > 1:
+        raise ValueError(
+            'the channels were traced from {0} different search sites (origins '
+            '{1}), and channels of different sites are not comparable. Select '
+            'one with channel.origin, or recompute with an explicit start_point, '
+            'which gives a run a single site.'.format(
+                len(origins), ', '.join(str(o) for o in sorted(origins))))
+
+    if max_proc is None:
+        import multiprocessing
+        max_proc = multiprocessing.cpu_count()
+    max_proc = max(1, min(int(max_proc), n))
+
+    _reportClusterMemory(n, max_proc)
+
+    LOGGER.timeit('_prody_channel_cluster_dist')
+    distances, unit = _channelClusterDistances(channels, method, h, max_proc,
+                                               mp_context, df_max)
+    LOGGER.report("Measured {0:,} channel pairs by {1} in %.2fs.".format(
+        n * (n - 1) // 2, method), '_prody_channel_cluster_dist')
+
+    if not np.isfinite(distances).all():
+        raise ValueError('the distances hold {0} non-finite value(s), which '
+                         'would take the linkage with them. This is a bug; '
+                         'please report the structure and settings.'.format(
+                             int((~np.isfinite(distances)).sum())))
+
+    LOGGER.timeit('_prody_channel_cluster_link')
+    Z = linkage(distances, method=linkage_method)
+    LOGGER.report('Built the linkage in %.2fs.', '_prody_channel_cluster_link')
+
+    quantiles = {q: float(np.percentile(distances, q))
+                 for q in (1, 2, 5, 10, 25, 50, 75, 100)}
+
+    if cutoff is None:
+        if percentile is None:
+            percentile = default_percentile
+        cutoff = float(np.percentile(distances, percentile))
+        _warn("cutting at the {0:g}th percentile of this run's own distances, "
+              "which is {1:.4f} {2}. A percentile is a property of the channels "
+              "it was measured over, so another run - even of the same protein - "
+              "will resolve it to a different distance and its cluster numbers "
+              "will not match these. Pass cutoff={1:.4f} to both runs to compare "
+              "them.".format(percentile, cutoff, unit))
+    cutoff = float(cutoff)
+
+    # A cutoff that falls on a value many pairs hold exactly separates none of
+    # them from each other, so it decides less than its position suggests. The
+    # 'surface' distance builds such a plateau by construction, reading exactly
+    # zero wherever two routes overlap, and a low percentile lands on it.
+    tied = float((distances == cutoff).mean())
+    if tied > 0.001:
+        above = distances[distances > cutoff]
+        _warn("the cutoff {0:.4f} {1} is a value {2:.1%} of the pairs hold "
+              "exactly, so it does not separate any of them. {3}{4}".format(
+                  cutoff, unit, tied,
+                  'Two routes whose tubes overlap are exactly zero apart. '
+                  if cutoff == 0.0 else '',
+                  'The first distance clear of it is {0:.4f}, at the {1:.1f}th '
+                  'percentile.'.format(
+                      float(above.min()),
+                      100.0 * float((distances <= above.min()).mean()))
+                  if len(above) else 'Every pair is at this distance.'))
+
+    flat = fcluster(Z, cutoff, criterion='distance')
+    labels = _canonicalClusterLabels(flat, channels, index)
+
+    sizes = np.bincount(labels)
+    LOGGER.info("{0} channels of {1} frames fell into {2} cluster{3} at "
+                "{4:.4f} {5}; the largest holds {6} and {7} hold one.".format(
+                    n, len(channels_all), len(sizes),
+                    '' if len(sizes) == 1 else 's', cutoff, unit,
+                    int(sizes.max()), int((sizes == 1).sum())))
+
+    labels_all, at = [], 0
+    for frame in channels_all:
+        labels_all.append(labels[at:at + len(frame)])
+        at += len(frame)
+
+    if return_details:
+        return labels_all, {'Z': Z, 'cutoff': cutoff, 'method': method,
+                            'linkage_method': linkage_method, 'unit': unit,
+                            'index': index, 'sizes': sizes,
+                            'quantiles': quantiles,
+                            'frames': frame_numbers,
+                            'channels': channels,
+                            'shape': [len(f) for f in channels_all]}
+    return labels_all
+
+
+def getChannelClusterLabels(details, cutoff=None, percentile=None):
+    """Cut an existing clustering again, without measuring the distances anew.
+
+    The distances are nearly all of the cost and the cutoff is the part worth
+    trying more than once, so the linkage from
+    ``calcChannelClusters(return_details=True)`` is cut here in milliseconds.
+    Labels are canonicalised exactly as they are there, so the same cutoff gives
+    the same numbering either way."""
+
+    from scipy.cluster.hierarchy import fcluster
+
+    if cutoff is not None and percentile is not None:
+        raise ValueError('give cutoff or percentile, not both.')
+    for key in ('Z', 'cutoff', 'index', 'channels', 'shape'):
+        if key not in details:
+            raise ValueError("details is missing {0!r}; pass the dict returned "
+                             "by calcChannelClusters(return_details=True), not "
+                             "one built by hand.".format(key))
+
+    if percentile is not None:
+        quantiles = details.get('quantiles') or {}
+        if percentile in quantiles:
+            cutoff = quantiles[percentile]
+        else:
+            raise ValueError(
+                'the distances are not kept, so only the percentiles measured '
+                'at the time are available: {0}. Pass one of those, or a '
+                'cutoff.'.format(', '.join(str(q) for q in sorted(quantiles))))
+        _warn("cutting at the {0:g}th percentile, {1:.4f} {2}; see the note in "
+              "calcChannelClusters about comparing runs.".format(
+                  percentile, cutoff, details.get('unit', '')))
+    elif cutoff is None:
+        cutoff = details['cutoff']
+
+    flat = fcluster(details['Z'], float(cutoff), criterion='distance')
+    labels = _canonicalClusterLabels(flat, details['channels'],
+                                     details['index'])
+
+    labels_all, at = [], 0
+    for count in details['shape']:
+        labels_all.append(labels[at:at + count])
+        at += count
+    return labels_all
 
 
 def calcSurfaceCavitiesMultipleFrames(atoms, trajectory=None, output_path=None,
