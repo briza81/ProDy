@@ -40,7 +40,8 @@ __all__ =['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames',
            'getLinkParametersMultipleFrames', 'getLinkResidueNamesMultipleFrames',
            'scanSurfaceCavityParameters', 'connectChannelsToSurfaceCavities',
            'calcFrequentObjectResidues', 'showFrequentObjectResidues',
-           'calcChannelClusters', 'getChannelClusterLabels']
+           'calcChannelClusters', 'getChannelClusterLabels',
+           'getChannelClusterParameters', 'saveChannelClusters']
 
 # Van der Waals radii in Angstrom, by element symbol (upper case). The radii the
 # tessellation is built on, and the ones the lining report measures a Voronoi
@@ -4259,6 +4260,395 @@ def getChannelClusterLabels(details, cutoff=None, percentile=None):
         labels_all.append(labels[at:at + count])
         at += count
     return labels_all
+
+
+def _channelClusterRows(details, labels_all, min_channels=None, top=None):
+    """One row per cluster, and the numbers of the ones left out.
+
+    Filtering is a reporting choice and never a reclustering: an ensemble throws
+    off hundreds of clusters, most of them one channel seen once, and a table of
+    those buries the routes that persist. The labels are not renumbered, so a
+    cluster quoted from a filtered table is the same cluster in an unfiltered one.
+    Because the labels are already ordered by size, ``top`` is clusters 0 to X-1
+    and needs no second sort."""
+
+    channels = details['channels']
+    index = details['index']
+    frames = details['frames']
+    labels = np.concatenate([np.asarray(part, dtype=int)
+                             for part in labels_all]) if labels_all else \
+        np.empty(0, dtype=int)
+    if len(labels) != len(channels):
+        raise ValueError(
+            'labels_all holds {0} labels but the details hold {1} channels. '
+            'Pass the labels that came from this same clustering.'.format(
+                len(labels), len(channels)))
+
+    n_frames = len(labels_all)
+    rows, suppressed = [], 0
+    for label in range(int(labels.max()) + 1 if len(labels) else 0):
+        members = np.flatnonzero(labels == label)
+        if len(members) == 0:
+            continue
+        if min_channels is not None and len(members) < min_channels:
+            suppressed += 1
+            continue
+        if top is not None and label >= top:
+            suppressed += 1
+            continue
+
+        seen = {frames[index[m][0]] for m in members}
+        widths = np.array([channels[m].bottleneck for m in members], dtype=float)
+        lengths = np.array([channels[m].length for m in members], dtype=float)
+        curves = np.array([channels[m].curvature for m in members], dtype=float)
+        costs = np.array([channels[m].cost if channels[m].cost is not None
+                          else np.nan for m in members], dtype=float)
+        # The widest instance, which is the frame to open when looking at what
+        # the route can pass at its most open rather than on average.
+        widest = members[int(np.nanargmax(widths))] if np.isfinite(widths).any() \
+            else members[0]
+
+        def _stat(values, how):
+            if not np.isfinite(values).any():
+                return float('nan')
+            return float(how(values[np.isfinite(values)]))
+
+        rows.append({
+            'cluster': label,
+            'channels': len(members),
+            'snapshots': len(seen),
+            'frequency': len(seen) / float(n_frames) if n_frames else float('nan'),
+            'bottleneck': _stat(widths, np.mean),
+            'bottleneck_sd': _stat(widths, np.std),
+            'length': _stat(lengths, np.mean),
+            'length_sd': _stat(lengths, np.std),
+            'curvature': _stat(curves, np.mean),
+            'curvature_sd': _stat(curves, np.std),
+            'cost': _stat(costs, np.mean),
+            'widest_frame': frames[index[widest][0]],
+            'widest_channel': index[widest][1],
+            'members': members,
+        })
+    return rows, suppressed
+
+
+def getChannelClusterParameters(details, labels_all, min_channels=None, top=None,
+                                **kwargs):
+    """How persistent each cluster of channels is, and how wide it runs.
+
+    One row per cluster: how many channels fell into it, how many snapshots those
+    came from, the fraction of snapshots the route was open in, and the mean and
+    spread of its bottleneck, length and curvature.
+
+    Unlike the ``get*ParametersMultipleFrames`` family this takes no
+    ``trajectory``. That argument exists there only to name per-frame files
+    ``_frame3`` rather than ``_model3``; a clustering yields one table for the
+    whole ensemble, so there is nothing for it to name.
+
+    :arg details: The dict from ``calcChannelClusters(return_details=True)``.
+    :type details: dict
+
+    :arg labels_all: The labels from the same clustering, as returned by
+        :func:`calcChannelClusters` or :func:`getChannelClusterLabels`.
+    :type labels_all: list of ndarray
+
+    :arg min_channels: Leave out clusters holding fewer than this many channels.
+        Reporting only: nothing is renumbered and no channel changes cluster.
+    :type min_channels: int or None
+
+    :arg top: Keep only the this many largest clusters. The labels are already
+        ordered by size, so this is clusters 0 to ``top`` - 1.
+    :type top: int or None
+
+    :arg param_file_name: Write the table to
+        ``<param_file_name>_Parameters_All_clusters.txt``.
+    :type param_file_name: str
+
+    :returns: One dict per reported cluster, in cluster order. A dict rather than
+        the parallel lists of :func:`getChannelParameters`, there being nine
+        columns here and no natural order among them.
+    :rtype: list of dict
+
+    Example usage:
+    labels_all, details = calcChannelClusters('run.pqr', return_details=True)
+    rows = getChannelClusterParameters(details, labels_all, min_channels=10)
+    """
+
+    param_file_name = kwargs.pop('param_file_name', None)
+    if kwargs:
+        raise TypeError('getChannelClusterParameters() got an unexpected '
+                        'keyword argument {0}.'.format(
+                            ', '.join(repr(k) for k in sorted(kwargs))))
+
+    rows, suppressed = _channelClusterRows(details, labels_all, min_channels, top)
+
+    LOGGER.info("{0} cluster{1} by {2} at {3:.4f} {4}, over {5} frame{6}.".format(
+        len(rows), '' if len(rows) == 1 else 's', details.get('method', '?'),
+        details.get('cutoff', float('nan')), details.get('unit', ''),
+        len(labels_all), '' if len(labels_all) == 1 else 's'))
+    if suppressed:
+        LOGGER.info("{0} further cluster{1} not shown; the filters are on the "
+                    "table only, and no channel changed cluster.".format(
+                        suppressed, '' if suppressed == 1 else 's'))
+
+    # Three decimals throughout, which is what the files hold: the REMARK a
+    # channel is read back from writes its length, bottleneck and curvature to
+    # three, so a mean shown to two would hide a digit that is actually there.
+    header = ("cluster  channels  snapshots  frequency  bottleneck [Å]    "
+              "length [Å]        curvature          cost  widest")
+    LOGGER.info(header)
+    LOGGER.info('-' * len(header))
+    for row in rows:
+        LOGGER.info(
+            "{0:>7d}  {1:>8d}  {2:>9d}  {3:>9.4f}  {4:>7.3f} ± {5:<6.3f}  "
+            "{6:>7.3f} ± {7:<6.3f}  {8:>6.3f} ± {9:<6.3f}  {10:>6.4g}  "
+            "{11}:{12}".format(
+                row['cluster'], row['channels'], row['snapshots'],
+                row['frequency'], row['bottleneck'], row['bottleneck_sd'],
+                row['length'], row['length_sd'], row['curvature'],
+                row['curvature_sd'], row['cost'],
+                row['widest_frame'], row['widest_channel']))
+
+    if param_file_name is not None:
+        path = '{0}_Parameters_All_clusters.txt'.format(param_file_name)
+        with open(path, 'w') as handle:
+            handle.write('# channels snapshots frequency bottleneck sd length '
+                         'sd curvature sd cost widest_frame:widest_channel\n')
+            for row in rows:
+                handle.write('{0}_cluster{1}: {2} {3} {4:.4f} {5:.3f} {6:.3f} '
+                             '{7:.3f} {8:.3f} {9:.4f} {10:.4f} {11:.4g} '
+                             '{12}:{13}\n'.format(
+                                 param_file_name, row['cluster'],
+                                 row['channels'], row['snapshots'],
+                                 row['frequency'], row['bottleneck'],
+                                 row['bottleneck_sd'], row['length'],
+                                 row['length_sd'], row['curvature'],
+                                 row['curvature_sd'], row['cost'],
+                                 row['widest_frame'], row['widest_channel']))
+        LOGGER.info('Wrote {0}.'.format(path))
+
+    return rows
+
+
+#: The palette both viewers below are built from, so that a rank means the same
+#: colour whether it numbers a channel of one structure or a cluster of a whole
+#: ensemble, and so that the two cannot drift apart. Needs ``colorsys`` and
+#: ``cmd`` already imported by the script that includes it.
+_VIS_PALETTE = r'''# --- Palette ---
+# CAVER 3's first six colours, from its out/pymol/modules/rgb.py in the order
+# its view.py hands them to tunnel clusters. They are what makes a CAVER figure
+# recognisable, so they are kept verbatim. Its remaining 1000 are a long table
+# of pastels that the generator below beats on separation, so they are not.
+CAVER_PRIMARIES = [(0.0, 0.0, 1.0),    # blue
+                   (0.0, 1.0, 0.0),    # green
+                   (1.0, 0.0, 0.0),    # red
+                   (0.0, 1.0, 1.0),    # cyan
+                   (1.0, 1.0, 0.0),    # yellow
+                   (1.0, 0.0, 1.0)]    # magenta
+
+# Past the six, colours are generated rather than tabulated. The hue steps by
+# the golden angle -- an irrational fraction of the circle, so it never returns
+# to a hue it has used and consecutive steps land as far apart as the circle
+# allows -- while saturation and value cycle on 3, so neighbours differ in more
+# than hue alone. The offset keeps the early generated hues clear of the six
+# primaries: without it rank 12 lands beside blue. It was chosen by maximising
+# the smallest CIE-Lab separation over 8..24 colours, where most cases sit,
+# which holds that separation near 15 where CAVER's own table dropped to 5.
+GOLDEN_ANGLE = (3.0 - 5.0 ** 0.5) / 2.0
+HUE_OFFSET = 0.098
+SATURATION_VALUE = ((0.95, 1.00), (0.70, 1.00), (0.95, 0.72))
+
+def caverColour(rank):
+    """Name of the colour for a 0-based channel rank, registered on first use.
+
+    A pure function of the rank, with no table to run off the end of: a rank is
+    the same colour in every structure and every run, whatever was loaded
+    beside it and however many channels the case turned out to have.
+    """
+    if rank < len(CAVER_PRIMARIES):
+        name, rgb = "caver%d" % (rank + 1), CAVER_PRIMARIES[rank]
+    else:
+        step = rank - len(CAVER_PRIMARIES)
+        saturation, value = SATURATION_VALUE[step % len(SATURATION_VALUE)]
+        name = "gen%d" % rank
+        rgb = colorsys.hsv_to_rgb(
+            (HUE_OFFSET + (step + 1) * GOLDEN_ANGLE) % 1.0, saturation, value)
+    cmd.set_color(name, list(rgb))
+    return name
+'''
+
+#: Source of the PyMOL viewer that :func:`saveChannelClusters` leaves beside the
+#: per-cluster files. Draws each channel as a line rather than a string of
+#: spheres: one channel is a couple of hundred spheres and a cluster of an
+#: ensemble holds thousands of channels, which is not a scene a viewer will turn.
+_VIS_CLUSTERS_SCRIPT = r'''import colorsys
+import glob
+import os
+import re
+import sys
+
+import pymol
+from pymol import cmd
+
+# Invoke as:  pymol view_clusters.py -- protein.pdb
+# The protein is optional. __file__ points into PyMOL's own directory under
+# `pymol -cq`, so the script's location comes from pymol.__script__.
+here = os.path.dirname(os.path.abspath(pymol.__script__))
+# Only a structure counts as the protein. Without the "--" separator PyMOL
+# leaves its own arguments in sys.argv, this script among them, and handing a
+# .py to cmd.load takes the whole session down.
+protein_file = next((a for a in sys.argv[1:]
+                     if os.path.isfile(a)
+                     and a.lower().endswith(('.pdb', '.ent', '.cif', '.pqr'))),
+                    None)
+
+files = sorted(glob.glob(os.path.join(here, "cluster*.pqr")),
+               key=lambda f: int(re.search(r"cluster(\d+)", f).group(1)))
+if not files:
+    print("No cluster*.pqr beside this script.")
+
+''' + _VIS_PALETTE + r'''
+if protein_file:
+    protein_name = os.path.splitext(os.path.basename(protein_file))[0]
+    cmd.load(protein_file, protein_name)
+    cmd.hide("everything", protein_name)
+    cmd.show("cartoon", protein_name)
+    cmd.color("grey80", protein_name)
+    cmd.set("cartoon_transparency", 0.6, protein_name)
+    print(f"Loaded protein: {protein_name}")
+
+for path in files:
+    name = os.path.splitext(os.path.basename(path))[0]
+    rank = int(re.search(r"cluster(\d+)", name).group(1))
+    cmd.load(path, name)
+    # The bonds come from the CONECT records in the file, so each channel is one
+    # strand and no strand runs into the next.
+    cmd.hide("everything", name)
+    cmd.show("lines", name)
+    cmd.color(caverColour(rank), name)
+
+cmd.set("line_width", 1.5)
+cmd.bg_color("white")
+cmd.zoom()
+print(f"Loaded {len(files)} cluster(s). Hide one with e.g. `disable cluster3`.")
+'''
+
+
+def saveChannelClusters(details, labels_all, output_path, min_channels=None,
+                        top=None, max_per_cluster=5000, **kwargs):
+    """One file per cluster, drawn as lines, with a PyMOL viewer beside them.
+
+    The clusters are the thing worth looking at, and there is no way to look at
+    them in the per-frame output: one route is spread over a thousand files. This
+    puts each route in a file of its own, as CAVER leaves its clusters beside a
+    viewer.
+
+    Lines rather than spheres. A single channel is already a couple of hundred
+    probe spheres, so a cluster of a thousand channels is a scene no viewer will
+    turn, while the same routes as polylines open at once. Colours come from the
+    same palette as the per-channel viewer, so cluster 0 is CAVER blue.
+
+    :arg details: The dict from ``calcChannelClusters(return_details=True)``.
+    :type details: dict
+
+    :arg labels_all: The labels from that same clustering.
+    :type labels_all: list of ndarray
+
+    :arg output_path: Directory to write into, created when missing.
+    :type output_path: str
+
+    :arg min_channels: Leave out clusters holding fewer than this many channels,
+        exactly as in :func:`getChannelClusterParameters`, so a table and a scene
+        made with the same filters hold the same clusters.
+    :type min_channels: int or None
+
+    :arg top: Keep only this many of the largest clusters.
+    :type top: int or None
+
+    :arg max_per_cluster: At most this many channels drawn per cluster, taken
+        widest first so what is dropped is the narrowest rather than an arbitrary
+        share. A cluster of a long trajectory holds thousands of near-identical
+        routes and the rest add nothing to see.
+    :type max_per_cluster: int
+
+    :returns: The paths written, the viewer last.
+    :rtype: list of str
+
+    Example usage:
+    labels_all, details = calcChannelClusters('run.pqr', return_details=True)
+    saveChannelClusters(details, labels_all, 'clusters', top=20)
+    """
+
+    import os
+
+    if kwargs:
+        raise TypeError('saveChannelClusters() got an unexpected keyword '
+                        'argument {0}.'.format(
+                            ', '.join(repr(k) for k in sorted(kwargs))))
+
+    rows, suppressed = _channelClusterRows(details, labels_all, min_channels, top)
+    if not rows:
+        raise ValueError('no cluster passed the filters, so there is nothing to '
+                         'draw. Lower min_channels or raise top.')
+
+    output_path = str(output_path)
+    if not os.path.isdir(output_path):
+        os.makedirs(output_path)
+
+    channels = details['channels']
+    written, drawn, capped = [], 0, 0
+
+    for row in rows:
+        members = row['members']
+        if len(members) > max_per_cluster:
+            widths = np.array([channels[m].bottleneck for m in members],
+                              dtype=float)
+            widths[~np.isfinite(widths)] = -np.inf
+            members = np.sort(members[np.argsort(-widths)[:max_per_cluster]])
+            capped += 1
+
+        path = os.path.join(output_path, 'cluster{0}.pqr'.format(row['cluster']))
+        serial = 1
+        with open(path, 'w') as handle:
+            handle.write("REMARK   cluster {0}: {1} of {2} channel(s) from {3} "
+                         "snapshot(s)\n".format(
+                             row['cluster'], len(members), row['channels'],
+                             row['snapshots']))
+            for slot, member in enumerate(members):
+                points, radii = _channelSamples(channels[member])
+                first = serial
+                for (x, y, z), radius in zip(points, radii):
+                    # The residue number tells one channel of the cluster from
+                    # the next, so a single route can still be picked out of the
+                    # file its cluster shares. Both counters wrap rather than
+                    # overrun their columns.
+                    handle.write("ATOM  %5d  H   FIL T%4d    "
+                                 "%8.3f%8.3f%8.3f%6.2f%6.2f\n" % (
+                                     serial % 100000, (slot + 1) % 10000,
+                                     x, y, z, 1.00, radius))
+                    serial += 1
+                for bond in range(first, serial - 1):
+                    handle.write("CONECT%5d%5d\n" % (bond % 100000,
+                                                     (bond + 1) % 100000))
+            handle.write('END\n')
+        written.append(path)
+        drawn += len(members)
+
+    viewer = os.path.join(output_path, 'view_clusters.py')
+    with open(viewer, 'w') as handle:
+        handle.write(_VIS_CLUSTERS_SCRIPT)
+    written.append(viewer)
+
+    LOGGER.info("Wrote {0} cluster file{1} holding {2} channels to {3}.".format(
+        len(rows), '' if len(rows) == 1 else 's', drawn, output_path))
+    if capped:
+        LOGGER.info("{0} cluster{1} cut to the {2} widest channels each.".format(
+            capped, ' was' if capped == 1 else 's were', max_per_cluster))
+    if suppressed:
+        LOGGER.info("{0} cluster{1} left out by the filters.".format(
+            suppressed, '' if suppressed == 1 else 's'))
+    LOGGER.info('View them with `pymol {0} -- <protein>.pdb`.'.format(viewer))
+    return written
 
 
 def calcSurfaceCavitiesMultipleFrames(atoms, trajectory=None, output_path=None,
@@ -10102,6 +10492,7 @@ class ChannelCalculator:
                 if cavity.tetrahedra_depths.get(tetra, np.inf) <= max_depth])
 
 
+
 #: Source of the PyMOL viewer that :func:`_writeVisScript` leaves beside the
 #: PQR output. Held inline so that this module carries everything it writes,
 #: and raw so the rank patterns keep their backslashes.
@@ -10117,9 +10508,14 @@ import sys
 protein_file = None
 channel_regex = None
 for arg in sys.argv[1:]:
-    if arg == "--":
+    # Only a structure counts as the protein, and PyMOL's own arguments are not
+    # arguments to this. Invoked without the "--" separator, sys.argv still holds
+    # them and this script's own name among them, and handing a .py to cmd.load
+    # takes the session down rather than reporting anything.
+    if arg == "--" or arg.startswith("-") or arg.lower().endswith(".py"):
         continue
-    if os.path.isfile(arg):
+    if os.path.isfile(arg) and arg.lower().endswith((".pdb", ".ent", ".cif",
+                                                     ".pqr")):
         if protein_file is None:
             protein_file = arg
     elif channel_regex is None:
@@ -10129,48 +10525,7 @@ if channel_regex is None:
     channel_regex = "*chl*.pqr"   # fallback default
 print(f"Using channel regex: {channel_regex}")
 
-# --- Palette ---
-# CAVER 3's first six colours, from its out/pymol/modules/rgb.py in the order
-# its view.py hands them to tunnel clusters. They are what makes a CAVER figure
-# recognisable, so they are kept verbatim. Its remaining 1000 are a long table
-# of pastels that the generator below beats on separation, so they are not.
-CAVER_PRIMARIES = [(0.0, 0.0, 1.0),    # blue
-                   (0.0, 1.0, 0.0),    # green
-                   (1.0, 0.0, 0.0),    # red
-                   (0.0, 1.0, 1.0),    # cyan
-                   (1.0, 1.0, 0.0),    # yellow
-                   (1.0, 0.0, 1.0)]    # magenta
-
-# Past the six, colours are generated rather than tabulated. The hue steps by
-# the golden angle -- an irrational fraction of the circle, so it never returns
-# to a hue it has used and consecutive steps land as far apart as the circle
-# allows -- while saturation and value cycle on 3, so neighbours differ in more
-# than hue alone. The offset keeps the early generated hues clear of the six
-# primaries: without it rank 12 lands beside blue. It was chosen by maximising
-# the smallest CIE-Lab separation over 8..24 colours, where most cases sit,
-# which holds that separation near 15 where CAVER's own table dropped to 5.
-GOLDEN_ANGLE = (3.0 - 5.0 ** 0.5) / 2.0
-HUE_OFFSET = 0.098
-SATURATION_VALUE = ((0.95, 1.00), (0.70, 1.00), (0.95, 0.72))
-
-def caverColour(rank):
-    """Name of the colour for a 0-based channel rank, registered on first use.
-
-    A pure function of the rank, with no table to run off the end of: a rank is
-    the same colour in every structure and every run, whatever was loaded
-    beside it and however many channels the case turned out to have.
-    """
-    if rank < len(CAVER_PRIMARIES):
-        name, rgb = "caver%d" % (rank + 1), CAVER_PRIMARIES[rank]
-    else:
-        step = rank - len(CAVER_PRIMARIES)
-        saturation, value = SATURATION_VALUE[step % len(SATURATION_VALUE)]
-        name = "gen%d" % rank
-        rgb = colorsys.hsv_to_rgb(
-            (HUE_OFFSET + (step + 1) * GOLDEN_ANGLE) % 1.0, saturation, value)
-    cmd.set_color(name, list(rgb))
-    return name
-
+''' + _VIS_PALETTE + r'''
 if protein_file:
     protein_name = os.path.splitext(os.path.basename(protein_file))[0]
     cmd.load(protein_file, protein_name)
