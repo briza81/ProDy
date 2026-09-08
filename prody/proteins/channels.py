@@ -1873,6 +1873,23 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         unaffected by this choice.
     :type edge_cost: str or None
 
+    :arg lining_atoms: Whether to record on every channel the atoms whose van der
+        Waals surface comes within ``lining_pad`` of its probe spheres, as
+        ``channel.lining`` (indices into the AtomGroup) and ``channel.lining_pad``.
+        Chamber links are not covered, being routes between two chambers rather
+        than to the solvent. Off by default;
+        :func:`calcChannelsMultipleFrames` turns it on, the lining being what a
+        route in one frame is matched against in the next. Distinct from the
+        residue lining reported by :func:`getChannelsLiningResidues`, which
+        measures to atom centres and completes whole residues.
+    :type lining_atoms: bool
+
+    :arg lining_pad: Clearance in Angstroms from the probe surface to the atom
+        surface for ``lining_atoms``. Both radii are subtracted, so it means the
+        same where the route is wide as where it is narrow, and does not stand in
+        for a van der Waals radius the way the residue lining's ``distA`` does.
+    :type lining_pad: float
+
     :returns: A tuple containing two elements:
         - `channels`: A list of detected channels, where each channel is an 
           object containing information about its path and geometry.
@@ -1928,8 +1945,10 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         'edge_cost': None,
         'weighted_cache': True,
         'weighted_mouth_depth': 2.5,
-        'min_tetrahedra': None, 
-        'max_tetrahedra': None, 
+        'min_tetrahedra': None,
+        'max_tetrahedra': None,
+        'lining_atoms': False,
+        'lining_pad': 2.0,
     }
 
     # Unknown keywords are an error rather than silently ignored: a misspelled
@@ -1955,8 +1974,10 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     weighted_cache = options['weighted_cache']
     weighted_mouth_depth = options['weighted_mouth_depth']
     min_tetrahedra = options['min_tetrahedra']
-    max_tetrahedra = options['max_tetrahedra'] 
-    
+    max_tetrahedra = options['max_tetrahedra']
+    lining_atoms = options['lining_atoms']
+    lining_pad = options['lining_pad']
+
 
     required = ['heapq', 'collections', 'scipy', 'pathlib', 'warnings']
     missing = []
@@ -2031,6 +2052,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     # diagram happens to be built on. Homogenization would otherwise make it a
     # function of max_deviation, which min_enclosure must not be.
     atom_coords = coords
+    atom_vdw = vdw_radii
     # For diagram="weighted" only: a homogenized-surface depth oracle used to relabel
     # the additively-weighted diagram's leaky surface mouths (see getSurfaceCavities).
     mouth_oracle = None
@@ -2414,6 +2436,26 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
                    for seed, label in cavity.seed_chambers.items()}
         for link in cavity.links:
             link.destination = reached.get(link.joined_chamber)
+
+    if lining_atoms:
+        # Channels only. A link joins two chambers and is not a route to the
+        # solvent, so it is not something one frame's lining is matched against
+        # in the next.
+        LOGGER.timeit('_prody_channels_lining')
+        lining_tree = _kdTree(atom_coords)
+        # Indices into the AtomGroup, not into the dry selection the tessellation
+        # is indexed by. `atoms` is a Selection here whatever it arrived as.
+        group_indices = atoms.getIndices()
+        for channel in channels:
+            centers, radii = _sampleObjectSpheres(channel)
+            channel.lining = group_indices[
+                _liningAtoms(atom_coords, lining_tree, atom_vdw,
+                             centers, radii, lining_pad)]
+            channel.lining_pad = float(lining_pad)
+        LOGGER.report("Gathered the lining atoms of {0} channel{1} within {2:.2f} Å "
+                      "of their surface in %.2fs.".format(
+                          len(channels), '' if len(channels) == 1 else 's',
+                          float(lining_pad)), '_prody_channels_lining')
 
     LOGGER.info("Found {0} channel{1}{2}.".format(
         len(channels), '' if len(channels) == 1 else 's',
@@ -4156,6 +4198,52 @@ def _liningResidues(atoms, tree, points, radii, distA):
     if hasattr(atoms, 'getAtomGroup'):   # a selection: index back into its group
         return atoms.getAtomGroup()[atoms.getIndices()[selected].tolist()]
     return atoms[selected.tolist()]
+
+
+def _liningAtoms(coords, tree, atom_radii, points, radii, pad):
+    """Indices of the atoms whose surface comes within *pad* of the object's own.
+
+    The criterion is the gap between the two spheres, ``|x_p - x_a| - r_p - r_a <=
+    pad``, so *pad* is a clearance from the probe surface to the atom surface and
+    means the same where the route is wide as where it is narrow, whatever element
+    the wall is made of.
+
+    Not :func:`_liningResidues` at a finer grain, and *pad* is not its ``distA``:
+    that one measures to the atom centre, so its distance also absorbs a van der
+    Waals radius it never subtracts, and it returns a whole residue as soon as one
+    of its atoms qualifies. Here an atom is present on its own account, which is
+    what makes the set comparable between conformations - a side chain that rotates
+    in place keeps the residue and exchanges the atoms.
+
+    A radius query rather than a k-nearest one: a fixed k truncates wherever the
+    wall is denser than the k it was chosen for, and the neighbours it drops are the
+    far ones the criterion is deciding on. ``query_ball_point`` takes no
+    per-neighbour radius, so the search is widened by the largest van der Waals
+    radius present and the candidates are then held to their own."""
+
+    coords = np.asarray(coords, dtype=float)
+    atom_radii = np.asarray(atom_radii, dtype=float)
+    points = np.asarray(points, dtype=float)
+    radii = np.asarray(radii, dtype=float)
+
+    if len(points) == 0 or len(coords) == 0:
+        return np.empty(0, dtype=int)
+
+    hits = tree.query_ball_point(points, radii + pad + float(atom_radii.max()))
+    counts = np.array([len(hit) for hit in hits], dtype=int)
+    if not counts.any():
+        return np.empty(0, dtype=int)
+
+    # One flat (probe, candidate) list, so the exact gap is a single vectorized
+    # pass rather than a per-probe one; the widened query leaves few candidates
+    # to reject, and none to add.
+    candidates = np.fromiter((atom for hit in hits for atom in hit),
+                             dtype=int, count=int(counts.sum()))
+    probes = np.repeat(np.arange(len(points)), counts)
+    gaps = (np.linalg.norm(points[probes] - coords[candidates], axis=1)
+            - radii[probes] - atom_radii[candidates])
+
+    return np.unique(candidates[gaps <= pad])
 
 
 def _oneLetterResname(residue):
@@ -6097,6 +6185,13 @@ class Channel:
         # link is built and kept only until calcChannels can translate it into
         # a start point, the labels themselves being internal to one run.
         self.joined_chamber = None
+        # lining: AtomGroup indices of the atoms whose surface comes within
+        # `lining_pad` of this channel's probe spheres, and the pad they were
+        # gathered at, so a set computed under one clearance is never compared
+        # against a set computed under another. Set by calcChannels on channels
+        # when it is asked for the lining, and never on links; None otherwise.
+        self.lining = None
+        self.lining_pad = None
 
     def _computeCurvature(self):
         """Path length divided by straight-line end-to-end distance."""
