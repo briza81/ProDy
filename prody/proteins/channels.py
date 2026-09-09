@@ -8621,12 +8621,27 @@ class ChannelCalculator:
 
     def getSurfaceCavities(self, cavities, interior_simplices, second_layer,
                            state, mouth_oracle=None):
+        interior_simplices = np.asarray(interior_simplices)
+        second_layer = np.asarray(second_layer)
+
+        # Which tetrahedra of the cleared state stand in the second layer, decided
+        # once for the whole mesh. np.isin builds a lookup over the atom index range
+        # each time it is called, so asking it per cavity rebuilt that table as many
+        # times as there are cavities and read four values out of each one.
+        if second_layer.size and interior_simplices.size:
+            size = max(int(interior_simplices.max()), int(second_layer.max())) + 1
+            in_second_layer = np.zeros(size, dtype=bool)
+            in_second_layer[second_layer.ravel()] = True
+            is_exit = in_second_layer[interior_simplices].all(axis=1)
+        else:
+            is_exit = np.zeros(len(interior_simplices), dtype=bool)
+
         surface_cavities = []
-        
+
         for cavity in cavities:
             tetrahedra = cavity.tetrahedra
-            second_layer_mask = np.isin(interior_simplices[tetrahedra], second_layer).all(axis=1)
-            
+            second_layer_mask = is_exit[tetrahedra]
+
             if np.any(second_layer_mask):
                 exit_tetrahedra = tetrahedra[second_layer_mask]
                 if mouth_oracle is not None:
@@ -8717,12 +8732,25 @@ class ChannelCalculator:
         # tetrahedra) to its farthest point, as a shortest path along Voronoi edges. This
         # is a physical length independent of tetrahedron size, so min_depth is mesh
         # invariant; the old +1-per-tetrahedron layer count grew as the mesh refined.
+        #
+        # One search covers every cavity. Cavities are the connected components of
+        # this same neighbour table, so no path leads out of one, and a multi-source
+        # Dijkstra seeded with every cavity's exits reaches each tetrahedron from the
+        # openings of its own cavity and from no others. Searching per cavity pays
+        # for the graph assembly and the scipy call once per component, which on a
+        # structure with hundreds of small voids costs more than the search.
+        if not cavities:
+            return
         degenerate = self._degenerateTetrahedra(simplices, vertices, points)
         scratch = np.full(neighbors.shape[0], -1, dtype=np.intp)
+        depths = self._geodesicDepth(
+            np.arange(neighbors.shape[0], dtype=np.intp),
+            np.concatenate([np.asarray(cavity.exit_tetrahedra, dtype=np.intp)
+                            for cavity in cavities]),
+            neighbors, vertices, degenerate, scratch)
         for cavity in cavities:
             tetra = np.asarray(cavity.tetrahedra, dtype=np.intp)
-            dist = self._geodesicDepth(tetra, cavity.exit_tetrahedra, neighbors,
-                                       vertices, degenerate, scratch)
+            dist = depths[tetra]
             finite = np.isfinite(dist)
             if not finite.any():
                 # No exit reached any tetrahedron (degenerate cavity); keep it minimal.
