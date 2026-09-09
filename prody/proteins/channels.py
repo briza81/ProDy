@@ -379,7 +379,9 @@ def _writeReferenceStructure(filename, atoms, coords):
     clustering and its pictures can be made later by someone who has only the
     output. Any frame serves as a backdrop, the frames being aligned."""
 
-    reference = atoms.copy()
+    # One coordinate set, or writePDB writes every frame the atoms carry as a
+    # model of its own and the backdrop becomes as large as the trajectory.
+    reference = _topologyOnly(atoms)
     reference.setCoords(np.asarray(coords, dtype=float))
     try:
         writePDB(str(filename), reference)
@@ -3686,10 +3688,26 @@ def _surfaceDistances(samples, h, max_proc=1, mp_context=None):
     through one another are not separated by how far their centres wander."""
 
     n = len(samples)
-    points = np.ascontiguousarray(
-        np.array([s[0] for s in samples], dtype=float).reshape(n * h, 3))
+    points = np.array([s[0] for s in samples], dtype=float).reshape(n * h, 3)
+
+    # Centred, then single precision. The two go together and neither is safe
+    # alone. |x-y|^2 is computed as |x|^2 + |y|^2 - 2 x.y, which cancels: a
+    # protein sits tens of Angstroms from the origin, so |x|^2 runs to thousands
+    # while the differences being resolved are fractions of an Angstrom, and in
+    # single precision those fractions are what the subtraction throws away.
+    # Moving the origin to the middle of the routes shrinks |x|^2 by more than an
+    # order of magnitude and gives the digits back.
+    #
+    # Single precision then halves the traffic, which is what this costs: the
+    # block of gaps is touched some seven times - clipped, rooted, both radii
+    # taken off, clipped again, then reduced along each route - and it is far too
+    # large for cache, so the time goes on moving it rather than on the matrix
+    # product. Measured close to twice as fast, at every process count, for the
+    # same clusters.
+    points = np.ascontiguousarray((points - points.mean(axis=0)),
+                                  dtype=np.float32)
     radii = np.ascontiguousarray(
-        np.array([s[1] for s in samples], dtype=float).reshape(n * h))
+        np.array([s[1] for s in samples], dtype=np.float32).reshape(n * h))
     squares = (points * points).sum(axis=1)
 
     if max_proc == 1:
@@ -4177,13 +4195,20 @@ def calcChannelClusters(pqr_files=None, method='centerline', cutoff=None,
     # reproduced a reference clustering, so that the default errs towards keeping
     # distinct routes apart rather than merging them, and a merge is something the
     # user asks for by raising it.
-    settings = {'centerline': ('complete', 5.0),
-                'surface': ('complete', 5.0),
-                'lining_atoms': ('average', 3.0)}
+    # (linkage, default percentile, default cutoff). The two geometric methods
+    # measure in Angstroms, whose useful value depends on the protein, so they
+    # default to a percentile of the run's own distances. 'lining_atoms' does
+    # not: a Jaccard distance is already a fraction of the atoms two routes
+    # share, so 0.6 means the same thing in any protein and on any number of
+    # frames, and a fixed cutoff is what makes two runs comparable. Its
+    # percentile is kept for anyone who asks for one explicitly.
+    settings = {'centerline': ('complete', 5.0, None),
+                'surface': ('complete', 5.0, None),
+                'lining_atoms': ('complete', 3.0, 0.6)}
     if method not in settings:
         raise ValueError("method must be 'centerline', 'surface' or "
                          "'lining_atoms', got {0!r}".format(method))
-    calibrated, default_percentile = settings[method]
+    calibrated, default_percentile, default_cutoff = settings[method]
 
     # Linkages whose merge heights are on the scale of the distances, minus the
     # one that joins two clusters on their single closest pair.
@@ -4279,7 +4304,14 @@ def calcChannelClusters(pqr_files=None, method='centerline', cutoff=None,
     quantiles = {q: float(np.percentile(distances, q))
                  for q in (1, 2, 5, 10, 25, 50, 75, 100)}
 
-    if cutoff is None:
+    if cutoff is None and percentile is None and default_cutoff is not None:
+        cutoff = default_cutoff
+        LOGGER.info("Cutting at {0:.4f} {1}, this method's default. It is a "
+                    "fraction of the atoms two routes share rather than a "
+                    "distance, so it means the same on any protein and any "
+                    "number of frames, and two runs cut here are "
+                    "comparable.".format(cutoff, unit))
+    elif cutoff is None:
         if percentile is None:
             percentile = default_percentile
         cutoff = float(np.percentile(distances, percentile))
