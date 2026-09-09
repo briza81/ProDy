@@ -429,11 +429,20 @@ def _writeMultiModelChannels(filename, frames, channels_all, atoms,
 
 def _calcChannelsMultipleFramesWorker(args):
     """Compute channels. Supporting function for muliprocessing in :func:`calcChannelsMultipleFrames`."""
-    frame_nr, atoms, frame_coords, frame_output_path, separate, start_point, return_details, kwargs = args
+    frame_nr, atoms, frame_coords, frame_output_path, separate, start_point, \
+        start_positions, return_details, kwargs = args
 
     LOGGER.info("Frame/model: {0}".format(frame_nr))
     atoms_copy = atoms.copy()
     atoms_copy.setCoords(frame_coords)
+
+    # A start point named by atoms moves with them, so it is taken from this
+    # frame's coordinates rather than from the ones the selection was made on.
+    # Naming atoms instead of a point is a way of saying "wherever these residues
+    # are now", and resolving it once against the first conformation would throw
+    # that away and anchor every frame to where the pocket used to be.
+    if start_positions is not None:
+        start_point = calcCenter(atoms_copy[start_positions])
 
     return calcChannels(atoms_copy, output_path=frame_output_path, separate=separate,
                         start_point=start_point, return_details=return_details, **kwargs)
@@ -3239,8 +3248,14 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         tetrahedron nearest the point and is seeded there, overriding the default
         automatic seed selection; see :func:`calcChannels` for how the seed is
         picked and for ``start_point_search``, which bounds how far from the point
-        it may lie. Coordinates must be given in Å.
-    :type start_point: list, tuple, or ndarray (length 3), or None
+        it may lie.
+
+        Given as atoms, the point is the centre of those atoms **in each frame**,
+        so it follows the pocket as the protein moves; given as coordinates, it
+        stays where it is put. Naming the residues that line the site is usually
+        what is meant over a trajectory, and is what a fixed point cannot express
+        once the protein has moved away from it. Coordinates must be in Å.
+    :type start_point: list, tuple, or ndarray (length 3), :class:`.Atomic`, or None
 
     :arg max_proc: Maximum number of parallel processes used for calculation. 
         If 1, files are processed serially. If None, all available CPU
@@ -3326,6 +3341,29 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
     # though calcChannels leaves it off.
     kwargs.setdefault('lining_atoms', True)
 
+    # Where the start point is given as atoms, each frame resolves it against its
+    # own coordinates. The positions are worked out once here, against `atoms`,
+    # because the workers see a copy of it and a selection carries indices into
+    # the group it was made from, which the copy no longer is.
+    start_positions = None
+    if start_point is not None and hasattr(start_point, 'getIndices'):
+        if start_point.numAtoms() == 0:
+            raise ValueError('start_point selection contains no atoms')
+        if hasattr(atoms, 'getIndices'):
+            position = {index: at for at, index in enumerate(atoms.getIndices())}
+        else:
+            position = None
+        try:
+            start_positions = ([position[index] for index
+                                in start_point.getIndices()] if position
+                               else start_point.getIndices().tolist())
+        except KeyError:
+            raise ValueError(
+                'the start_point selection holds atoms that are not in the '
+                'atoms passed to calcChannelsMultipleFrames, so it cannot be '
+                'followed through the frames. Select the start point from the '
+                'same object.')
+
     if multimodel and start_point is None:
         raise ValueError('multimodel=True requires start_point. Channels are '
                          'comparable across frames only when they were all '
@@ -3367,7 +3405,8 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
                 frame_output_path = None
             
             tasks.append((j0, atoms_copy, np.array(frame0.getCoords(), copy=True),
-                            frame_output_path, separate, start_point, return_details, kwargs))
+                            frame_output_path, separate, start_point,
+                            start_positions, return_details, kwargs))
         trajectory._nfi = nfi
 
     else:
@@ -3383,7 +3422,8 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
                     frame_output_path = None
                 
                 tasks.append((model_nr, atoms, np.array(coordsets[model_nr], copy=True),
-                                frame_output_path, separate, start_point, return_details, kwargs))
+                                frame_output_path, separate, start_point,
+                                start_positions, return_details, kwargs))
                 
         else:
             LOGGER.info("Include trajectory or use multi-model PDB file.")
