@@ -370,6 +370,26 @@ def _topologyFingerprint(atoms):
     return digest.hexdigest()[:16]
 
 
+def _writeReferenceStructure(filename, atoms, coords):
+    """The protein of the first frame, written beside the channels.
+
+    Routes are unreadable without the structure they run through, and a file of
+    channels carries no record of which frame, or which protein, they belong to.
+    Writing one frame beside them costs a few hundred kilobytes and means the
+    clustering and its pictures can be made later by someone who has only the
+    output. Any frame serves as a backdrop, the frames being aligned."""
+
+    reference = atoms.copy()
+    reference.setCoords(np.asarray(coords, dtype=float))
+    try:
+        writePDB(str(filename), reference)
+    except (IOError, OSError) as err:
+        _warn('could not write the reference structure {0}: {1}'.format(
+            filename, err))
+        return None
+    return str(filename)
+
+
 def _writeMultiModelChannels(filename, frames, channels_all, atoms,
                              trajectory=None, num_samples=5):
     """Every frame's channels in one file, as MODEL blocks.
@@ -3466,6 +3486,13 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         LOGGER.timeit('_prody_channels_multimodel')
         _writeMultiModelChannels(output_path, [task[0] for task in tasks],
                                  channels_all, atoms, trajectory)
+        # The first frame's protein, so the routes can be looked at later by
+        # someone holding nothing but this directory.
+        reference = _writeReferenceStructure(
+            str(output_path).rsplit('.', 1)[0] + '_reference.pdb',
+            atoms, tasks[0][2])
+        if reference:
+            LOGGER.info('Wrote the reference structure {0}.'.format(reference))
         LOGGER.report("Wrote {0} frames of channels to {1} in %.2fs.".format(
             len(tasks), output_path), '_prody_channels_multimodel')
         LOGGER.info("Channels of {0} frames written to {1}.".format(
@@ -4262,6 +4289,7 @@ def calcChannelClusters(pqr_files=None, method='centerline', cutoff=None,
                             'linkage_method': linkage_method, 'unit': unit,
                             'index': index, 'sizes': sizes,
                             'quantiles': quantiles,
+                            'files': _resolvePqrFiles(pqr_files),
                             'frames': frame_numbers,
                             'channels': channels,
                             'shape': [len(f) for f in channels_all]}
@@ -4313,7 +4341,14 @@ def getChannelClusterLabels(details, cutoff=None, percentile=None):
     return labels_all
 
 
-def _channelClusterRows(details, labels_all, min_channels=None, top=None):
+def _finiteOr(value, otherwise):
+    """*value* when it is a real number, *otherwise* when it is NaN or infinite."""
+
+    return float(value) if np.isfinite(value) else otherwise
+
+
+def _channelClusterRows(details, labels_all, min_channels=None, top=None,
+                        one_per_snapshot=True):
     """One row per cluster, and the numbers of the ones left out.
 
     Filtering is a reporting choice and never a reclustering: an ensemble throws
@@ -4349,6 +4384,27 @@ def _channelClusterRows(details, labels_all, min_channels=None, top=None):
             continue
 
         seen = {frames[index[m][0]] for m in members}
+
+        # One channel per snapshot, the cheapest, as CAVER's
+        # one_tunnel_in_snapshot does. A frame often yields several channels of
+        # one route - a fifth to a quarter of them here - and counting all of
+        # them makes a cluster look busier than the route is, and weights its
+        # mean width by however many near-copies a frame happened to produce.
+        # How often the route is open is unaffected: that is counted per
+        # snapshot either way.
+        if one_per_snapshot:
+            best = {}
+            for m in members:
+                frame = frames[index[m][0]]
+                cost = channels[m].cost
+                # Lowest Dijkstra cost, and where a channel carries none, the
+                # widest, which is the other reading of "the best way through".
+                rank = (0, cost) if cost is not None else (
+                    1, -_finiteOr(channels[m].bottleneck, -np.inf))
+                if frame not in best or rank < best[frame][0]:
+                    best[frame] = (rank, m)
+            members = np.array(sorted(m for _, m in best.values()), dtype=int)
+
         widths = np.array([channels[m].bottleneck for m in members], dtype=float)
         lengths = np.array([channels[m].length for m in members], dtype=float)
         curves = np.array([channels[m].curvature for m in members], dtype=float)
@@ -4384,7 +4440,7 @@ def _channelClusterRows(details, labels_all, min_channels=None, top=None):
 
 
 def getChannelClusterParameters(details, labels_all, min_channels=None, top=None,
-                                **kwargs):
+                                one_per_snapshot=True, **kwargs):
     """How persistent each cluster of channels is, and how wide it runs.
 
     One row per cluster: how many channels fell into it, how many snapshots those
@@ -4411,6 +4467,15 @@ def getChannelClusterParameters(details, labels_all, min_channels=None, top=None
         ordered by size, so this is clusters 0 to ``top`` - 1.
     :type top: int or None
 
+    :arg one_per_snapshot: Count one channel per cluster per snapshot, the one of
+        lowest cost, as CAVER's ``one_tunnel_in_snapshot`` does. A frame commonly
+        yields several channels of the same route, and counting all of them makes
+        a cluster look busier than the route is and weights its mean width by
+        however many near-copies that frame produced. Set False to count every
+        channel, which is what "how many routes are open at once" asks for. How
+        often a route is open is reported per snapshot and is the same either way.
+    :type one_per_snapshot: bool
+
     :arg param_file_name: Write the table to
         ``<param_file_name>_Parameters_All_clusters.txt``.
     :type param_file_name: str
@@ -4431,7 +4496,8 @@ def getChannelClusterParameters(details, labels_all, min_channels=None, top=None
                         'keyword argument {0}.'.format(
                             ', '.join(repr(k) for k in sorted(kwargs))))
 
-    rows, suppressed = _channelClusterRows(details, labels_all, min_channels, top)
+    rows, suppressed = _channelClusterRows(details, labels_all, min_channels, top,
+                                           one_per_snapshot)
 
     LOGGER.info("{0} cluster{1} by {2} at {3:.4f} {4}, over {5} frame{6}.".format(
         len(rows), '' if len(rows) == 1 else 's', details.get('method', '?'),
@@ -4541,17 +4607,24 @@ import sys
 import pymol
 from pymol import cmd
 
-# Invoke as:  pymol view_clusters.py -- protein.pdb
-# The protein is optional. __file__ points into PyMOL's own directory under
-# `pymol -cq`, so the script's location comes from pymol.__script__.
+# Invoke as:  pymol view_clusters.py [-- protein.pdb]
+# __file__ points into PyMOL's own directory under `pymol -cq`, so the script's
+# location comes from pymol.__script__.
 here = os.path.dirname(os.path.abspath(pymol.__script__))
 # Only a structure counts as the protein. Without the "--" separator PyMOL
 # leaves its own arguments in sys.argv, this script among them, and handing a
 # .py to cmd.load takes the whole session down.
 protein_file = next((a for a in sys.argv[1:]
                      if os.path.isfile(a)
-                     and a.lower().endswith(('.pdb', '.ent', '.cif', '.pqr'))),
+                     and a.lower().endswith(('.pdb', '.ent', '.cif'))),
                     None)
+if protein_file is None:
+    # The structure the clusters were found in, if it was written beside them.
+    # Channels mean nothing without the protein they run through, and whoever
+    # opens this later may not know which frame they belong to.
+    beside = sorted(glob.glob(os.path.join(here, '*.pdb'))
+                    + glob.glob(os.path.join(here, '*.cif')))
+    protein_file = beside[0] if beside else None
 
 files = sorted(glob.glob(os.path.join(here, "cluster*.pqr")),
                key=lambda f: int(re.search(r"cluster(\d+)", f).group(1)))
@@ -4586,7 +4659,8 @@ print(f"Loaded {len(files)} cluster(s). Hide one with e.g. `disable cluster3`.")
 
 
 def saveChannelClusters(details, labels_all, output_path, min_channels=None,
-                        top=None, max_per_cluster=5000, **kwargs):
+                        top=None, max_per_cluster=5000, protein=None,
+                        one_per_snapshot=True, **kwargs):
     """One file per cluster, drawn as lines, with a PyMOL viewer beside them.
 
     The clusters are the thing worth looking at, and there is no way to look at
@@ -4622,6 +4696,21 @@ def saveChannelClusters(details, labels_all, output_path, min_channels=None,
         routes and the rest add nothing to see.
     :type max_per_cluster: int
 
+    :arg one_per_snapshot: Draw one channel per cluster per snapshot, the one of
+        lowest cost, as in :func:`getChannelClusterParameters`, so a picture and
+        a table made from the same clustering hold the same routes. Set False to
+        draw every channel, which shows the spread of a route within a frame as
+        well as across frames.
+    :type one_per_snapshot: bool
+
+    :arg protein: The structure the channels were found in, written beside them
+        so the viewer opens with something to show them against. A route means
+        nothing without the protein it runs through, and the clusters carry no
+        record of which frame they belong to. Given a path it is copied, given
+        atoms they are written out. For an ensemble any frame will do as a
+        backdrop, the channels having been clustered in one aligned frame.
+    :type protein: str, :class:`.Atomic`, or None
+
     :returns: The paths written, the viewer last.
     :rtype: list of str
 
@@ -4637,7 +4726,8 @@ def saveChannelClusters(details, labels_all, output_path, min_channels=None,
                         'argument {0}.'.format(
                             ', '.join(repr(k) for k in sorted(kwargs))))
 
-    rows, suppressed = _channelClusterRows(details, labels_all, min_channels, top)
+    rows, suppressed = _channelClusterRows(details, labels_all, min_channels, top,
+                                           one_per_snapshot)
     if not rows:
         raise ValueError('no cluster passed the filters, so there is nothing to '
                          'draw. Lower min_channels or raise top.')
@@ -4685,6 +4775,32 @@ def saveChannelClusters(details, labels_all, output_path, min_channels=None,
         written.append(path)
         drawn += len(members)
 
+    if protein is None:
+        # The run that wrote the channels left its first frame beside them, so
+        # the backdrop is there to be found rather than asked for.
+        for source in details.get('files') or []:
+            beside = str(source).rsplit('.', 1)[0] + '_reference.pdb'
+            if os.path.isfile(beside):
+                protein = beside
+                break
+        else:
+            _warn('no reference structure was found beside the channels, so the '
+                  'viewer will open the clusters against nothing. Pass protein= '
+                  'to place one, or rerun the channels with multimodel=True, '
+                  'which leaves one beside its output.')
+
+    if protein is not None:
+        # Not protein.pdb: PyMOL names the object after the file, and "protein"
+        # is a selection keyword there.
+        reference = os.path.join(output_path, 'reference.pdb')
+        if hasattr(protein, 'getCoords'):
+            writePDB(reference, protein)
+        else:
+            import shutil
+            shutil.copyfile(str(protein), reference)
+        written.append(reference)
+        LOGGER.info('Wrote the reference structure {0}.'.format(reference))
+
     viewer = os.path.join(output_path, 'view_clusters.py')
     with open(viewer, 'w') as handle:
         handle.write(_VIS_CLUSTERS_SCRIPT)
@@ -4698,7 +4814,8 @@ def saveChannelClusters(details, labels_all, output_path, min_channels=None,
     if suppressed:
         LOGGER.info("{0} cluster{1} left out by the filters.".format(
             suppressed, '' if suppressed == 1 else 's'))
-    LOGGER.info('View them with `pymol {0} -- <protein>.pdb`.'.format(viewer))
+    LOGGER.info('View them with `pymol {0}{1}`.'.format(
+        viewer, '' if protein is not None else ' -- <protein>.pdb'))
     return written
 
 
