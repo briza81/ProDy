@@ -3506,9 +3506,13 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         output_path = Path(output_path)
         if multimodel:
             # One file, so the path names that file rather than a stem the
-            # per-frame names are built from.
+            # per-frame names are built from. Compressed when the caller named
+            # only a directory and so expressed no preference: an ensemble's
+            # channels outgrow the trajectory they came from, and everything
+            # that reads them back takes .pqr.gz wherever it takes .pqr. A
+            # caller who names the file decides for themselves.
             if output_path.is_dir():
-                output_path = output_path / "channels.pqr"
+                output_path = output_path / "channels.pqr.gz"
             else:
                 # A trailing .gz asks for the file to be compressed and is kept;
                 # what has to name a channels file is the suffix beneath it.
@@ -4169,37 +4173,19 @@ def _reportClusterMemory(n, max_proc):
                   peak / 2.0 ** 30, available / 2.0 ** 30, max_proc))
 
 
-def calcChannelClusters(pqr_files=None, method='centerline', cutoff=None,
-                        percentile=None, linkage_method=None,
-                        max_proc=2, mp_context=None, return_details=False,
-                        **kwargs):
+def calcChannelClusters(pqr_files=None, method='lining_atoms', cutoff=None,
+                        linkage_method=None, max_proc=2, mp_context=None,
+                        return_details=False, **kwargs):
     """Group the channels of many frames into the routes they are frames of.
 
     :func:`calcChannelsMultipleFrames` finds channels frame by frame, and nothing
     says that channel 2 of frame 3 and channel 5 of frame 400 are the same route
     seen twice. This groups them, by hierarchical clustering over a pairwise
     distance between channels, so that a route can be counted, averaged and
-    followed through the trajectory.
-
+    followed through the trajectory. 
+    
     There is no single-frame counterpart and so no ``MultipleFrames`` suffix:
     clustering only means anything across frames.
-
-    Three distances, which fail differently, so a route all three separate is a
-    firmer result than one only the cheapest does:
-
-    ``'centerline'``
-        The route as h points and h radii, compared coordinate by coordinate
-        (L1). Cheapest by an order of magnitude, and the default.
-    ``'surface'``
-        The mean gap between the two tubes' surfaces, each point measured to the
-        nearest point of the other route with both radii taken off, and clipped
-        at zero so overlapping routes read zero. Sees width where
-        ``'centerline'`` sees position.
-    ``'lining_atoms'``
-        Jaccard distance between the sets of atoms the routes touch, needing
-        ``channel.lining`` from ``calcChannels(lining_atoms=True)``. The only one
-        of the three that does not read coordinates, so the only one that
-        survives frames that were never aligned.
 
     :arg pqr_files: The channels to cluster, as written by
         :func:`calcChannelsMultipleFrames`: a list of paths, a folder, or None
@@ -4209,24 +4195,38 @@ def calcChannelClusters(pqr_files=None, method='centerline', cutoff=None,
         appear twice.
     :type pqr_files: list, str or None
 
-    :arg method: ``'centerline'``, ``'surface'`` or ``'lining_atoms'``.
+    :arg method: Which distance to cluster on. Default ``'lining_atoms'``.
+
+        ``'lining_atoms'`` is the Jaccard distance over the atoms each route
+        touches. It is the default for three reasons: it is a set rather than a
+        geometry, so it is the only one that still works on a trajectory whose
+        frames are not superposed; its cutoff is a fraction of the atoms two
+        routes share, so it means the same on any protein, where the other two
+        are lengths in Angstrom that might need to be calibrated; & it is fast,
+        only 3-5x slower than ``'centerline'``.
+
+        ``'centerline'`` is an L1 distance between centrelines resampled to
+        ``h`` points. The cheapest of the three, and the closest in spirit to
+        CAVER's own clustering.
+
+        ``'surface'`` is the clipped gap between the routes' surfaces. It is 
+        20-50x slower than ``'centerline'``  and ~10x than ``'lining_atoms'``. 
+        But can answer whether two routes are physically the same corridor 
+        rather than whether their centres run together.
+
     :type method: str
 
     :arg cutoff: Distance below which two channels are one route, in Angstroms
         for ``'centerline'`` and ``'surface'`` and as a Jaccard distance for
-        ``'lining_atoms'``. Mutually exclusive with *percentile*. Pin it to
-        compare one run against another.
+        ``'lining_atoms'``. Each method has a default, so this is for a
+        protein the defaults do not suit: with ``return_details=True`` the
+        ``quantiles`` of the measured distances say where the run's own
+        distances lie, and a cutoff read off those is reproducible in a way a
+        percentile of them is not.
     :type cutoff: float or None
 
-    :arg percentile: Cut where this percentage of all pairwise distances falls
-        below, instead of at a fixed distance. Warned about on every use: a
-        percentile is a property of the set it is measured on, so adding frames
-        moves it. Defaults to 5 for ``'centerline'`` and ``'surface'`` and 3 for
-        ``'lining_atoms'`` when neither this nor *cutoff* is given.
-    :type percentile: float or None
-
-    :arg linkage_method: ``'complete'`` (the default for the two geometric
-        methods), ``'average'`` (for ``'lining_atoms'``) or ``'weighted'``.
+    :arg linkage_method: ``'complete'`` (the default for every method),
+        ``'average'`` or ``'weighted'``.
         ``'single'`` is refused for chaining whole clusters together through one
         near pair; ``'ward'``, ``'centroid'`` and ``'median'`` are refused
         because they need Euclidean coordinates, which none of these distances
@@ -4281,25 +4281,27 @@ def calcChannelClusters(pqr_files=None, method='centerline', cutoff=None,
 
     from scipy.cluster.hierarchy import linkage, fcluster
 
-    # Each method's linkage and default percentile. The linkage is the one it was
-    # calibrated with; the percentile is deliberately below the value that best
-    # reproduced a reference clustering, so that the default errs towards keeping
-    # distinct routes apart rather than merging them, and a merge is something the
-    # user asks for by raising it.
-    # (linkage, default percentile, default cutoff). The two geometric methods
-    # measure in Angstroms, whose useful value depends on the protein, so they
-    # default to a percentile of the run's own distances. 'lining_atoms' does
-    # not: a Jaccard distance is already a fraction of the atoms two routes
-    # share, so 0.6 means the same thing in any protein and on any number of
-    # frames, and a fixed cutoff is what makes two runs comparable. Its
-    # percentile is kept for anyone who asks for one explicitly.
-    settings = {'centerline': ('complete', 5.0, None),
-                'surface': ('complete', 5.0, None),
-                'lining_atoms': ('complete', 3.0, 0.6)}
+    # (linkage, default cutoff) per method. The linkage is the one the method was
+    # calibrated with, and each cutoff errs towards keeping distinct routes apart
+    # rather than merging them, a merge being what the user asks for by raising
+    # it.
+    #
+    # All three are fixed values, none a percentile of the run's own distances.
+    # A percentile is a property of the set it is measured over, so it resolves
+    # to a different distance in every run and its labels cannot be compared
+    # between them - and on a distance clipped at zero it can resolve to zero
+    # itself, which separates nothing. What carries instead is that each of these
+    # is a quantity with a meaning: a Jaccard cutoff is a fraction of the atoms
+    # two routes share, and the two geometric ones are lengths in Angstrom - a
+    # mean per-point displacement between centerlines, and a gap between
+    # surfaces. 
+    settings = {'centerline': ('complete', 5.0),
+                'surface': ('complete', 2.0),
+                'lining_atoms': ('complete', 0.75)}
     if method not in settings:
         raise ValueError("method must be 'centerline', 'surface' or "
                          "'lining_atoms', got {0!r}".format(method))
-    calibrated, default_percentile, default_cutoff = settings[method]
+    calibrated, default_cutoff = settings[method]
 
     # Linkages whose merge heights are on the scale of the distances, minus the
     # one that joins two clusters on their single closest pair.
@@ -4309,8 +4311,8 @@ def calcChannelClusters(pqr_files=None, method='centerline', cutoff=None,
         raise ValueError(
             "linkage_method={0!r} needs Euclidean coordinates, and these are "
             "distances between routes, not points in a space. Its merge heights "
-            "are also not distances, so cutoff and percentile would not mean "
-            "what they say. Use 'complete', 'average' or "
+            "are also not distances, so a cutoff would not mean what it "
+            "says. Use 'complete', 'average' or "
             "'weighted'.".format(linkage_method))
     elif linkage_method == 'single':
         raise ValueError(
@@ -4327,16 +4329,17 @@ def calcChannelClusters(pqr_files=None, method='centerline', cutoff=None,
               "is not calibrated; pass cutoff= from your own "
               "inspection.".format(method, calibrated, linkage_method))
 
-    if cutoff is not None and percentile is not None:
-        raise ValueError('give cutoff or percentile, not both: one names a '
-                         'distance and the other asks for one to be found.')
-
     h = kwargs.pop('h', 10)
     df_max = kwargs.pop('df_max', 0.40)
     if kwargs:
         raise TypeError('calcChannelClusters() got an unexpected keyword '
-                        'argument {0}.'.format(
-                            ', '.join(repr(k) for k in sorted(kwargs))))
+                        'argument {0}.{1}'.format(
+                            ', '.join(repr(k) for k in sorted(kwargs)),
+                            " 'percentile' is gone: it resolved to a different "
+                            "distance in every run, so its labels could not be "
+                            "compared between them. Read details['quantiles'] "
+                            "and pass a cutoff." if 'percentile' in kwargs
+                            else ''))
 
     channels_all, frame_numbers = _readChannelFiles(pqr_files)
     LOGGER.info("Read {0} channels from {1} frame{2}.".format(
@@ -4395,23 +4398,10 @@ def calcChannelClusters(pqr_files=None, method='centerline', cutoff=None,
     quantiles = {q: float(np.percentile(distances, q))
                  for q in (1, 2, 5, 10, 25, 50, 75, 100)}
 
-    if cutoff is None and percentile is None and default_cutoff is not None:
+    if cutoff is None:
         cutoff = default_cutoff
-        LOGGER.info("Cutting at {0:.4f} {1}, this method's default. It is a "
-                    "fraction of the atoms two routes share rather than a "
-                    "distance, so it means the same on any protein and any "
-                    "number of frames, and two runs cut here are "
-                    "comparable.".format(cutoff, unit))
-    elif cutoff is None:
-        if percentile is None:
-            percentile = default_percentile
-        cutoff = float(np.percentile(distances, percentile))
-        _warn("cutting at the {0:g}th percentile of this run's own distances, "
-              "which is {1:.4f} {2}. A percentile is a property of the channels "
-              "it was measured over, so another run - even of the same protein - "
-              "will resolve it to a different distance and its cluster numbers "
-              "will not match these. Pass cutoff={1:.4f} to both runs to compare "
-              "them.".format(percentile, cutoff, unit))
+        LOGGER.info("Cutting at {0:.4f} {1}, this method's default.".format(
+            cutoff, unit))
     cutoff = float(cutoff)
 
     # A cutoff that falls on a value many pairs hold exactly separates none of
@@ -4459,7 +4449,7 @@ def calcChannelClusters(pqr_files=None, method='centerline', cutoff=None,
     return labels_all
 
 
-def getChannelClusterLabels(details, cutoff=None, percentile=None):
+def getChannelClusterLabels(details, cutoff=None):
     """Cut an existing clustering again, without measuring the distances anew.
 
     The distances are nearly all of the cost and the cutoff is the part worth
@@ -4470,27 +4460,13 @@ def getChannelClusterLabels(details, cutoff=None, percentile=None):
 
     from scipy.cluster.hierarchy import fcluster
 
-    if cutoff is not None and percentile is not None:
-        raise ValueError('give cutoff or percentile, not both.')
     for key in ('Z', 'cutoff', 'index', 'channels', 'shape'):
         if key not in details:
             raise ValueError("details is missing {0!r}; pass the dict returned "
                              "by calcChannelClusters(return_details=True), not "
                              "one built by hand.".format(key))
 
-    if percentile is not None:
-        quantiles = details.get('quantiles') or {}
-        if percentile in quantiles:
-            cutoff = quantiles[percentile]
-        else:
-            raise ValueError(
-                'the distances are not kept, so only the percentiles measured '
-                'at the time are available: {0}. Pass one of those, or a '
-                'cutoff.'.format(', '.join(str(q) for q in sorted(quantiles))))
-        _warn("cutting at the {0:g}th percentile, {1:.4f} {2}; see the note in "
-              "calcChannelClusters about comparing runs.".format(
-                  percentile, cutoff, details.get('unit', '')))
-    elif cutoff is None:
+    if cutoff is None:
         cutoff = details['cutoff']
 
     flat = fcluster(details['Z'], float(cutoff), criterion='distance')
