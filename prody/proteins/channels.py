@@ -370,6 +370,35 @@ def _topologyFingerprint(atoms):
     return digest.hexdigest()[:16]
 
 
+def _channelFileOpen(path, mode='r'):
+    """:func:`open`, gzipped when the name ends in ``.gz``.
+
+    Text mode either way, so callers read and write lines without caring. The
+    name decides, not a flag: the file has to be readable by whatever opens it
+    next, and the suffix is what tells that reader too.
+
+    Level 6 is gzip's own default and the knee of the curve here: level 1 leaves
+    a file a fifth larger, level 9 takes three times as long for another five
+    per cent."""
+
+    if str(path).endswith('.gz'):
+        import gzip
+        return gzip.open(str(path), mode + 't', compresslevel=6)
+    return open(str(path), mode)
+
+
+def _referenceStructurePath(path):
+    """``<name>_reference.pdb`` beside a channels file.
+
+    A ``.gz`` comes off first, or the reference of ``channels.pqr.gz`` would be
+    named after ``channels.pqr`` and carry the suffix into its own name."""
+
+    text = str(path)
+    if text.endswith('.gz'):
+        text = text[:-3]
+    return text.rsplit('.', 1)[0] + '_reference.pdb'
+
+
 def _writeReferenceStructure(filename, atoms, coords):
     """The protein of the first frame, written beside the channels.
 
@@ -443,7 +472,7 @@ def _writeMultiModelChannels(filename, frames, channels_all, atoms,
         if source:
             header.append("REMARK   frames from %s\n" % source)
 
-    with open(str(filename), 'w') as out:
+    with _channelFileOpen(filename, 'w') as out:
         out.writelines(header)
         for frame_nr, channels in zip(frames, channels_all):
             out.write("MODEL%9d\n" % frame_nr)
@@ -3329,6 +3358,13 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         since channels are comparable across frames only when every frame was
         traced from the same site. Default is False, so existing per-frame
         scripts are unaffected.
+
+        Name the file with a ``.gz`` and it is written compressed, which is worth
+        doing at ensemble scale: the records are text and repetitive, so they
+        take about a quarter of the room, less than the trajectory they came
+        from. Everything that reads channels back - :func:`calcChannelClusters`,
+        the folder scan, the viewer left beside the file - takes ``.pqr.gz``
+        wherever it takes ``.pqr``, so nothing has to be unpacked first.
     :type multimodel: bool
 
     :arg start_point: Optional starting point for channel search, applied to every
@@ -3473,8 +3509,15 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
             # per-frame names are built from.
             if output_path.is_dir():
                 output_path = output_path / "channels.pqr"
-            elif output_path.suffix not in ('.pqr', '.pdb'):
-                output_path = output_path.with_suffix('.pqr')
+            else:
+                # A trailing .gz asks for the file to be compressed and is kept;
+                # what has to name a channels file is the suffix beneath it.
+                name = str(output_path)
+                zipped = name.endswith('.gz')
+                plain = name[:-3] if zipped else name
+                if not plain.endswith(('.pqr', '.pdb')):
+                    plain = str(Path(plain).with_suffix('.pqr'))
+                output_path = Path(plain + ('.gz' if zipped else ''))
         elif output_path.suffix == ".pqr":
             output_path = output_path.with_suffix('')
 
@@ -3567,7 +3610,7 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         # The first frame's protein, so the routes can be looked at later by
         # someone holding nothing but this directory.
         reference = _writeReferenceStructure(
-            str(output_path).rsplit('.', 1)[0] + '_reference.pdb',
+            _referenceStructurePath(output_path),
             atoms, tasks[0][2])
         if reference:
             LOGGER.info('Wrote the reference structure {0}.'.format(reference))
@@ -3873,12 +3916,17 @@ def _resolvePqrFiles(pqr_files):
 
     import os
 
+    # A run told to write a .gz leaves .pqr.gz, so a scan that matched only .pqr
+    # would find nothing and report an empty folder rather than a compressed one.
+    suffixes = ('.pqr', '.pqr.gz')
+
     if pqr_files is False or pqr_files is None:
-        return sorted(f for f in os.listdir('.') if f.endswith('.pqr'))
+        return sorted(f for f in os.listdir('.') if f.endswith(suffixes))
     if isinstance(pqr_files, str):
         if os.path.isdir(pqr_files):
             return sorted(os.path.join(pqr_files, f)
-                          for f in os.listdir(pqr_files) if f.endswith('.pqr'))
+                          for f in os.listdir(pqr_files)
+                          if f.endswith(suffixes))
         return [pqr_files]
     if isinstance(pqr_files, (list, tuple)):
         return [str(f) for f in pqr_files]
@@ -3955,7 +4003,7 @@ def _readChannelFiles(pqr_files):
                 seen[(frame, index)] = path
                 frames.setdefault(frame, []).append(channel)
 
-        with open(path) as handle:
+        with _channelFileOpen(path) as handle:
             for line in handle:
                 if line.startswith('MODEL'):
                     _flush(here, frame)
@@ -4945,7 +4993,7 @@ def saveChannelClusters(details, labels_all, output_path, min_channels=None,
         # The run that wrote the channels left its first frame beside them, so
         # the backdrop is there to be found rather than asked for.
         for source in details.get('files') or []:
-            beside = str(source).rsplit('.', 1)[0] + '_reference.pdb'
+            beside = _referenceStructurePath(source)
             if os.path.isfile(beside):
                 protein = beside
                 break
@@ -11137,6 +11185,7 @@ read and several gigabytes to hold, for a scene showing one state at a time.
 Step through them with the arrow keys, or `mset`/`mplay` to run it.
 """
 import colorsys
+import gzip
 import os
 import re
 import sys
@@ -11174,16 +11223,16 @@ if args and not separated:
           'arguments, or put `--` before them.' % ', '.join(args))
 
 
-def find(suffix):
+def find(*suffixes):
     """A named file of this type, else the only one lying beside the script."""
-    named = [a for a in args if a.endswith(suffix)]
+    named = [a for a in args if a.endswith(suffixes)]
     if named:
         return named[0]
-    beside = sorted(f for f in os.listdir(here) if f.endswith(suffix))
+    beside = sorted(f for f in os.listdir(here) if f.endswith(suffixes))
     return os.path.join(here, beside[0]) if beside else None
 
 
-channels = find('.pqr')
+channels = find('.pqr', '.pqr.gz')
 protein = find('.pdb')
 stride = next((int(a) for a in args if a.isdigit()), 10)
 
@@ -11195,7 +11244,10 @@ if channels is None:
 # cost this avoids is the reading and the holding, both of which happen at load.
 kept = 0
 handle = tempfile.NamedTemporaryFile('w', suffix='.pqr', delete=False)
-with open(channels) as source:
+# The strided copy is written plain whatever the source is: it is read once,
+# straight away, by a PyMOL that would otherwise have to decompress it again.
+opener = gzip.open if channels.endswith('.gz') else open
+with opener(channels, 'rt') as source:
     # True until the first MODEL, so the file's own header is carried over, then
     # only for the frames kept. A channel's REMARK belongs to the model it sits
     # in and goes with it: carried across regardless, a skipped frame leaves its
@@ -11211,7 +11263,10 @@ handle.close()
 
 # Named apart from the file, not after it: a stray load of the same .pqr then
 # lands in an object of its own rather than appending its models to these.
-name = re.sub(r'\W+', '_', os.path.splitext(os.path.basename(channels))[0]) + '_frames'
+stem = os.path.basename(channels)
+if stem.endswith('.gz'):
+    stem = stem[:-3]
+name = re.sub(r'\W+', '_', os.path.splitext(stem)[0]) + '_frames'
 cmd.load(handle.name, name, discrete=1)
 os.unlink(handle.name)
 cmd.hide('everything', name)
