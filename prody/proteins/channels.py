@@ -1838,8 +1838,33 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         rather than rerouting them. Filtering is therefore cheap, but it cannot
         recover a wide route that the search did not take - if raising it leaves
         you with too few channels, raise ``inner_radius`` instead and let the
-        channels be traced afresh.
+        channels be traced afresh, or set ``prune_narrow_edges``, which makes
+        this floor bound the search as well.
     :type bottleneck: float
+
+    :arg prune_narrow_edges: Whether to leave Voronoi edges narrower than
+        ``bottleneck`` out of the search graph, instead of routing through them
+        and discarding the resulting channel afterwards. Default ``False``.
+
+        The two behaviours are the two established approaches: MOLE filters the
+        finished channels, CAVER prunes the graph. Filtering alone can lose a
+        corridor. Where a cheap route to a mouth pinches below the floor and a
+        wider route to the same mouth costs more, the search returns the cheap
+        one, the filter drops it, and the wider route - open, and the one asked
+        for - is never reported, because only one path per exit is returned.
+        Pruning takes those edges out of the search, so the wider way round is
+        what the search finds.
+
+        Pruning cannot cost a channel. A path over a dropped edge pinches at or
+        below that edge's gate, so the floor rejects it either way, while a path
+        that survives the floor crosses no dropped edge and keeps its cost, so it
+        remains the cheapest route to its exit. The difference is one-sided: the
+        same channels, plus any the filter was masking.
+
+        Off by default because it changes what is reported, and the channels it
+        adds are ones no earlier run listed. ``bottleneck=0`` prunes nothing
+        whatever this is set to, there being no floor to prune at.
+    :type prune_narrow_edges: bool
 
     :arg seed_radius: Probe radius, in Angstrom, that decides where a channel may
         *start*, as opposed to ``inner_radius``, which decides what it may pass
@@ -2082,6 +2107,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     # run never touches.
     CHANNELS_ADVANCED_OPTIONS = {
         'bottleneck': inner_radius,
+        'prune_narrow_edges': False,
         'seed_radius': max(1.4, inner_radius),
         'seed_volume': 50.0,
         'max_seeds': 20,
@@ -2110,6 +2136,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
 
     options = dict(CHANNELS_ADVANCED_OPTIONS, **kwargs)
     bottleneck = options['bottleneck']
+    prune_narrow_edges = options['prune_narrow_edges']
     seed_radius = options['seed_radius']
     seed_volume = options['seed_volume']
     max_seeds = options['max_seeds']
@@ -2442,8 +2469,9 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     # state, then run a single multi-target Dijkstra per cavity (scipy csgraph),
     # instead of one heap Dijkstra per (seed, exit) pair.
     simplices, neighbors, vertices = s_clr.getState()
-    graph = calculator.buildSparseGraph(simplices, neighbors, vertices, coords,
-                                         vdw_radii)
+    graph = calculator.buildSparseGraph(
+        simplices, neighbors, vertices, coords, vdw_radii,
+        gate_floor=bottleneck if prune_narrow_edges else 0.0)
 
     # Seed each cavity at its chambers rather than at its single deepest
     # tetrahedron. Placed after buildSparseGraph because the seed of a chamber is
@@ -8896,9 +8924,12 @@ class ChannelCalculator:
                 cost[ii] = np.trapz(rr ** (-z), nodes, axis=1) * L[ii]
         return cost
 
-    def buildSparseGraph(self, simplices, neighbors, vertices, points, vdw_radii):
+    def buildSparseGraph(self, simplices, neighbors, vertices, points, vdw_radii,
+                         gate_floor=0.0):
         # One weighted CSR adjacency matrix for the whole cleared state, built
         # from array ops over the (N, deg) neighbour table - no Python loop.
+        # Edges narrower than ``gate_floor`` are left out of it; see the pruning
+        # at the end.
         # Edge (tetra -> neigh) weight is l / (d**2 + b), where l is the
         # vertex-to-vertex distance and d is the gate clearance on the shared
         # Delaunay face (min clearance along the connecting Voronoi edge). The
@@ -8980,12 +9011,38 @@ class ChannelCalculator:
 
         # Per-edge gate cache (unordered key) read by _pathGates: each face edge
         # stored once, keyed (lo, hi). The reported bottleneck reads the same map.
+        # Filled before the pruning below, so a gate is available whether or not
+        # its edge is left in the graph.
         undirected = face & (rows < cols)
         self._edge_bottleneck = {
             (int(i), int(j)): float(v)
             for i, j, v in zip(rows[undirected], cols[undirected],
                                d[undirected])
         }
+
+        # Edges the floor's probe does not fit through are dropped, so the search
+        # routes around them instead of crossing one and having the channel
+        # discarded afterwards by that same floor. calcChannels passes
+        # ``bottleneck`` here under prune_narrow_edges and 0 otherwise. The floor
+        # is that and not inner_radius: set below inner_radius it asks for
+        # channels narrower than the traversal probe, and pruning at the probe
+        # would delete exactly those.
+        #
+        # No channel can be lost this way. A path over a dropped edge pinches at
+        # or below that edge's gate, so the floor filters it either way, while
+        # every path that survives the filter uses only kept edges at unchanged
+        # cost and so remains the cheapest route to its exit. What can appear is
+        # a wider route to an exit whose cheapest one was narrow.
+        #
+        # ``d`` is the gate on face edges and the entered node's clearance on the
+        # rare non-face ones, where _pathGates reports the tighter of the two
+        # endpoints instead; d is then the larger of them, so an edge is dropped
+        # only when the gate it would report is below the floor as well.
+        if gate_floor > 0:
+            open_enough = d >= gate_floor
+            rows = rows[open_enough]
+            cols = cols[open_enough]
+            weight = weight[open_enough]
 
         return csr_matrix((weight, (rows, cols)), shape=(N, N))
 
