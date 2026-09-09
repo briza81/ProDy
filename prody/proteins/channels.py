@@ -7879,9 +7879,13 @@ def _rowsIsin(a, b):
     """Boolean mask marking which rows of 2D integer array ``a`` occur as a row
     in 2D array ``b`` (exact, order-sensitive match).
 
-    Uses a void-dtype view so each row is treated as a single hashable scalar,
-    turning an O(len(a) x len(b)) row-by-row scan into an O(len(a) + len(b))
-    hashed membership test.
+    Each row is reduced to one scalar so that the test is over scalars rather
+    than over rows. Where the indices are small enough for the whole row to fit
+    one 64-bit word - four vertices of at most sixteen bits each, which is a
+    tessellation of under 65536 points - they are packed into it, and numpy
+    compares machine integers. Otherwise the row is viewed as a void scalar,
+    which works for any width but is compared byte by byte and measured about
+    three times slower.
     """
     a = np.ascontiguousarray(a)
     b = np.ascontiguousarray(b)
@@ -7889,6 +7893,18 @@ def _rowsIsin(a, b):
         return np.zeros(a.shape[0], dtype=bool)
     if a.dtype != b.dtype:
         b = b.astype(a.dtype)
+
+    columns = a.shape[1]
+    if np.issubdtype(a.dtype, np.integer) and a.min() >= 0 and b.min() >= 0:
+        bits = max(int(a.max()), int(b.max())).bit_length() or 1
+        if bits * columns <= 64:
+            def pack(rows):
+                out = np.zeros(len(rows), dtype=np.uint64)
+                for column in range(columns):
+                    out = (out << np.uint64(bits)) | rows[:, column].astype(np.uint64)
+                return out
+            return np.isin(pack(a), pack(b))
+
     va = a.view(np.dtype((np.void, a.dtype.itemsize * a.shape[1]))).ravel()
     vb = b.view(np.dtype((np.void, b.dtype.itemsize * b.shape[1]))).ravel()
     return np.isin(va, vb)
@@ -8288,17 +8304,30 @@ class ChannelCalculator:
 
         return np.array([VDW_RADII[atom] for atom in atoms])
 
+    #: Directions by point count, shared by every atom homogenized in the run.
+    #: The lattice is a function of ``n`` alone, and homogenization asks for it
+    #: once per shell of every atom - thousands of times for a handful of
+    #: distinct counts. The cached arrays are handed out unwritable so that a
+    #: caller cannot alter what the next one receives.
+    _FIBONACCI_CACHE = {}
+
     def _fibonacciSphere(self, n):
         """Return ``n`` roughly evenly distributed unit vectors on a sphere using
         the Fibonacci (golden spiral) lattice."""
         n = int(np.maximum(1, n))
+        cached = ChannelCalculator._FIBONACCI_CACHE.get(n)
+        if cached is not None:
+            return cached
         indices = np.arange(n) + 0.5
         phi = np.arccos(1.0 - 2.0 * indices / n)
         theta = np.pi * (1.0 + 5.0 ** 0.5) * indices
         x = np.sin(phi) * np.cos(theta)
         y = np.sin(phi) * np.sin(theta)
         z = np.cos(phi)
-        return np.stack([x, y, z], axis=1)
+        directions = np.stack([x, y, z], axis=1)
+        directions.flags.writeable = False
+        ChannelCalculator._FIBONACCI_CACHE[n] = directions
+        return directions
 
     def _shellPointCount(self, rad, rho, max_deviation):
         """Number of equal balls of radius ``rho`` to place on a shell of radius
@@ -8473,29 +8502,41 @@ class ChannelCalculator:
 
             
     def findGroups(self, neigh, is_cavity=True):
+        """The connected components of the neighbour table, in index order.
+
+        Every tetrahedron reachable from another through shared faces belongs to
+        one void. The traversal is scipy's, over a sparse adjacency built from the
+        neighbour table, rather than a Python stack: the table runs to hundreds of
+        thousands of rows and walking it a node at a time spends its time in the
+        interpreter.
+
+        Components come out ordered by their lowest member and each is listed
+        ascending, which a depth-first walk does not guarantee. Nothing downstream
+        reads the order - a cavity is ranked by volume and tie-broken on its lowest
+        tetrahedron - but the members are summed to give that volume, so the order
+        is fixed here rather than left to how the walk happened to go."""
+
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components
+
         x = neigh.shape[0]
-        visited = np.zeros(x, dtype=bool)
-        groups = []
+        if x == 0:
+            return []
 
-        def dfs(tetra_index):
-            stack = [tetra_index]
-            current_group = []
-            while stack:
-                index = stack.pop()
-                if not visited[index]:
-                    visited[index] = True
-                    current_group.append(index)
-                    stack.extend(neighbor for neighbor in neigh[index] if neighbor != -1 and not visited[neighbor])
-            return np.array(current_group)
+        rows = np.repeat(np.arange(x), neigh.shape[1])
+        cols = np.asarray(neigh).ravel()
+        linked = cols != -1
+        adjacency = coo_matrix(
+            (np.ones(int(linked.sum()), dtype=np.int8),
+             (rows[linked], cols[linked])), shape=(x, x))
+        count, labels = connected_components(adjacency, directed=False)
 
-        for i in range(x):
-            if not visited[i]:
-                current_group = dfs(i)
-                if is_cavity:
-                    groups.append(Cavity(current_group, False))
-                else:
-                    groups.append(current_group)
+        order = np.argsort(labels, kind='stable')
+        splits = np.flatnonzero(np.diff(labels[order])) + 1
+        groups = [np.sort(part) for part in np.split(order, splits)]
 
+        if is_cavity:
+            return [Cavity(part, False) for part in groups]
         return groups
 
     def findChambers(self, simplices, neighbors, vertices, points, vdw_radii,
@@ -9969,19 +10010,36 @@ class ChannelCalculator:
             filtered.append(cavity)
         return filtered
 
+    @staticmethod
+    def tetrahedronVolumes(corners):
+        """Volumes of many tetrahedra at once, from an ``(m, 4, 3)`` array.
+
+        One sixth of the scalar triple product of the three edges meeting at the
+        last corner - the same quantity :meth:`calculateTetrahedronVolume` gives
+        for one, computed over the whole array. A cavity holds tens of thousands
+        of tetrahedra, and calling a three-vector cross product on each spends
+        its time in numpy's dispatch rather than on the arithmetic."""
+
+        corners = np.asarray(corners, dtype=float)
+        if corners.size == 0:
+            return np.zeros(0)
+        edges = corners[:, :3, :] - corners[:, 3:4, :]
+        return np.abs(np.einsum('ij,ij->i', edges[:, 0],
+                                np.cross(edges[:, 1], edges[:, 2]))) / 6.0
+
     def calculateTetrahedronVolume(self, a, b, c, d):
-        return abs(np.dot(a - d, np.cross(b - d, c - d))) / 6.0
+        """Volume of one tetrahedron. See :meth:`tetrahedronVolumes` for many."""
+
+        return float(self.tetrahedronVolumes(
+            np.array([[a, b, c, d]], dtype=float))[0])
 
     def calculate_cavity_volumes(self, cavities, simplices, coords):
         """Calculate approximate cavity volumes from Delaunay tetrahedra."""
 
         for cavity in cavities:
-            volume = 0.0
-            for tetra in cavity.tetrahedra:
-                atom_ids = simplices[tetra]
-                a, b, c, d = coords[atom_ids]
-                volume += self.calculateTetrahedronVolume(a, b, c, d)
-            cavity.volume = volume
+            tetrahedra = np.asarray(cavity.tetrahedra, dtype=int)
+            cavity.volume = float(self.tetrahedronVolumes(
+                coords[simplices[tetrahedra]]).sum()) if len(tetrahedra) else 0.0
 
     @staticmethod
     def orderCavitiesByVolume(cavities):
@@ -10004,12 +10062,14 @@ class ChannelCalculator:
         if labels.size == 0 or labels.max() < 0:
             return np.zeros(0)
 
-        volumes = np.zeros(int(labels.max()) + 1)
-        for tetra, label in enumerate(labels):
-            if label >= 0:
-                a, b, c, d = coords[simplices[tetra]]
-                volumes[label] += self.calculateTetrahedronVolume(a, b, c, d)
-        return volumes
+        labels = np.asarray(labels)
+        labelled = np.flatnonzero(labels >= 0)
+        if labelled.size == 0:
+            return np.zeros(int(labels.max()) + 1)
+        return np.bincount(
+            labels[labelled],
+            weights=self.tetrahedronVolumes(coords[simplices[labelled]]),
+            minlength=int(labels.max()) + 1)
 
     def filterCavitiesByVolume(self, cavities, min_volume=None, max_volume=None):
         """Filter cavities by approximate volume."""
