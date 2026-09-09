@@ -2835,7 +2835,11 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         if into_directory:
             _writeVisScript(output_path.parent)
     else:
-        LOGGER.info("No output path given.")
+        # Debug rather than info: the frames of a multi-model run are computed
+        # with no path each, the parent writing the one file once they are all
+        # back, so at info this announces "no output path given" once per frame
+        # of a run that was given one. A caller who omitted it knows they did.
+        LOGGER.debug("No output path given.")
 
     LOGGER.report('Channel calculation completed in %.2fs.', '_prody_calcChannels')
 
