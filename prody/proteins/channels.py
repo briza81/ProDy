@@ -447,10 +447,27 @@ def _writeMultiModelChannels(filename, frames, channels_all, atoms,
             out.write("ENDMDL\n")
 
 
+def _topologyOnly(atoms):
+    """A copy of *atoms* holding one coordinate set, to be sent to the workers.
+
+    Every frame is computed by a worker that is handed the coordinates it is to
+    use and overwrites the copy's own with them, so what it needs from *atoms* is
+    which atoms they are, not the rest of the trajectory. Left whole, the object
+    is pickled into every batch of tasks with all of its frames attached: a task
+    whose own frame is a tenth of a megabyte was measured pickling to fifty,
+    which is the whole trajectory sent once per batch to compute one frame of it.
+    """
+
+    template = atoms.copy()
+    if template.numCoordsets() > 1:
+        template.delCoordset(list(range(1, template.numCoordsets())))
+    return template
+
+
 def _calcChannelsMultipleFramesWorker(args):
     """Compute channels. Supporting function for muliprocessing in :func:`calcChannelsMultipleFrames`."""
     frame_nr, atoms, frame_coords, frame_output_path, separate, start_point, \
-        start_positions, return_details, kwargs = args
+        start_positions, drop_surface, return_details, kwargs = args
 
     LOGGER.info("Frame/model: {0}".format(frame_nr))
     atoms_copy = atoms.copy()
@@ -464,8 +481,21 @@ def _calcChannelsMultipleFramesWorker(args):
     if start_positions is not None:
         start_point = calcCenter(atoms_copy[start_positions])
 
-    return calcChannels(atoms_copy, output_path=frame_output_path, separate=separate,
-                        start_point=start_point, return_details=return_details, **kwargs)
+    result = calcChannels(atoms_copy, output_path=frame_output_path,
+                          separate=separate, start_point=start_point,
+                          return_details=return_details, **kwargs)
+
+    # The surface is the tessellation the channels were carved out of, and it is
+    # some two hundred times their size - a third of a million tetrahedra against
+    # a few dozen channels. It is what draws one structure's channels, which is
+    # not what a run of a thousand frames is for, and the clustering reads its
+    # geometry back from the written file rather than from here. Dropped in the
+    # worker rather than in the parent, so it is never pickled either: kept, it
+    # would cross the process boundary once per frame and then be held for every
+    # frame at once, the results all being collected before any can be discarded.
+    if drop_surface:
+        result = (result[0], None) + tuple(result[2:])
+    return result
 
 
 def _calcSurfaceCavitiesMultipleFramesWorker(args):
@@ -3298,8 +3328,15 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         See the available parameters in calcChannels().
     :type kwargs: dict
 
-    :returns: List of channels and surfaces computed for each frame or model. 
+    :returns: List of channels and surfaces computed for each frame or model.
         Each entry in the list corresponds to a specific frame or model.
+
+        Under ``multimodel=True`` the surfaces come back as ``None``, one per
+        frame so the two lists stay the same length. A surface is the whole
+        tessellation - some two hundred times the size of the channels found in
+        it - and it exists to draw one structure's channels, which a run of many
+        frames is not for; the clustering reads what it needs from the written
+        file. Kept, they would be what a long run runs out of memory on.
     :rtype: list of lists
 
     Example usage:
@@ -3415,7 +3452,7 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         else:
             traj = trajectory[start_frame:stop_frame+1]
         
-        atoms_copy = atoms.copy()
+        atoms_copy = _topologyOnly(atoms)
         for j0, frame0 in enumerate(traj, start=start_frame):
             # Nothing is written per frame under multimodel: the parent writes
             # every frame into one file once the workers have returned.
@@ -3426,12 +3463,15 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
             
             tasks.append((j0, atoms_copy, np.array(frame0.getCoords(), copy=True),
                             frame_output_path, separate, start_point,
-                            start_positions, return_details, kwargs))
+                            start_positions, multimodel, return_details, kwargs))
         trajectory._nfi = nfi
 
     else:
         if atoms.numCoordsets() > 1:
             coordsets = atoms.getCoordsets()
+            # The frames travel one per task; the atoms they belong to travel
+            # once, without them.
+            atoms_copy = _topologyOnly(atoms)
             for i in range(len(atoms.getCoordsets()[start_frame:stop_frame])):
                 model_nr = i + start_frame
 
@@ -3440,10 +3480,10 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
                                                          "channels")
                 else:
                     frame_output_path = None
-                
-                tasks.append((model_nr, atoms, np.array(coordsets[model_nr], copy=True),
+
+                tasks.append((model_nr, atoms_copy, np.array(coordsets[model_nr], copy=True),
                                 frame_output_path, separate, start_point,
-                                start_positions, return_details, kwargs))
+                                start_positions, multimodel, return_details, kwargs))
                 
         else:
             LOGGER.info("Include trajectory or use multi-model PDB file.")
