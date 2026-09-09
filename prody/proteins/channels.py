@@ -3628,6 +3628,17 @@ def _surfaceDistances(samples, h, max_proc=1, mp_context=None):
     if max_proc == 1:
         return _surfaceBand((0, n, points, squares, radii, h, n))
 
+    # Each worker holds its BLAS to one thread, or they multiply out against the
+    # processes and contend for the same cores. Checked here rather than in the
+    # worker, which would say it once per process, and reported rather than
+    # swallowed: without it the run is markedly slower for no visible reason.
+    if not checkAndImport('threadpoolctl'):
+        _warn('threadpoolctl is not installed, so each of the {0} workers will '
+              'let its BLAS use every core and they will compete for them. The '
+              "distances are the same either way, only slower - measured about a "
+              'third longer on a large ensemble. Install threadpoolctl, or pass '
+              'max_proc=1.'.format(max_proc))
+
     tasks = [(start, stop, points, squares, radii, h, n)
              for start, stop in _rowBands(n, max_proc)]
 
@@ -7919,6 +7930,11 @@ class ChannelCalculator:
             if not len(point):
                 break
             samples = query[point] + directions[ray] * distance
+            # Every core, even when this frame is itself one of several running
+            # in parallel. Restricting it to one thread per worker was measured
+            # slower at every process count: the workers do not all reach this
+            # point together, so there is capacity to use, and the scheduler
+            # shares it better than a fixed limit does.
             hit = tree.query(samples, distance_upper_bound=radius,
                              workers=-1)[0] <= radius
             blocked[point[hit], ray[hit]] = True
