@@ -417,6 +417,14 @@ def _writeMultiModelChannels(filename, frames, channels_all, atoms,
             len(frames), '' if len(frames) == 1 else 's'),
         "REMARK   MODEL numbers are frame numbers, so the files of two frame\n",
         "REMARK   ranges concatenate without renumbering\n",
+        "REMARK\n",
+        "REMARK   In PyMOL load this as:  load <file>, discrete=1\n",
+        "REMARK   One frame finds more channels than another, so the models\n",
+        "REMARK   hold different numbers of atoms, and a plain load folds them\n",
+        "REMARK   into one object: the first model's bonds are then drawn over\n",
+        "REMARK   every other frame's atoms and the routes come out as strands\n",
+        "REMARK   running between channels that never touched.\n",
+        "REMARK\n",
         "REMARK   topology %s  atoms %d  title %s\n" % (
             _topologyFingerprint(atoms), atoms.numAtoms(),
             atoms.getTitle() or 'unnamed'),
@@ -3567,6 +3575,13 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
             len(tasks), output_path), '_prody_channels_multimodel')
         LOGGER.info("Channels of {0} frames written to {1}.".format(
             len(tasks), output_path))
+        # Said here as well as in the file's own header, because the file is
+        # normally opened straight from the shell and the flag is not guessable
+        # from what a plain load shows: it draws, it just draws the wrong bonds.
+        LOGGER.info("    load it in PyMOL as `load {0}, discrete=1` - the "
+                    "models hold different numbers of atoms, and a plain load "
+                    "folds them together.".format(Path(output_path).name))
+        _writeFramesVisScript(Path(output_path).parent)
 
     if return_details:
         return channels_all, surfaces_all, details_all
@@ -4667,30 +4682,81 @@ CAVER_PRIMARIES = [(0.0, 0.0, 1.0),    # blue
 # the golden angle -- an irrational fraction of the circle, so it never returns
 # to a hue it has used and consecutive steps land as far apart as the circle
 # allows -- while saturation and value cycle on 3, so neighbours differ in more
-# than hue alone. The offset keeps the early generated hues clear of the six
-# primaries: without it rank 12 lands beside blue. It was chosen by maximising
-# the smallest CIE-Lab separation over 8..24 colours, where most cases sit,
-# which holds that separation near 15 where CAVER's own table dropped to 5.
+# than hue alone.
 GOLDEN_ANGLE = (3.0 - 5.0 ** 0.5) / 2.0
 HUE_OFFSET = 0.098
 SATURATION_VALUE = ((0.95, 1.00), (0.70, 1.00), (0.95, 0.72))
 
+# A candidate is taken only once it stands this far in CIE-Lab from every colour
+# already issued. Stepping the hue cannot deliver that on its own: the six
+# primaries sit on sixths of the circle and the golden-angle sequence is dense,
+# so some rank always lands on one. No offset avoids it -- at the best the
+# sequence allows, rank 6 still fell 16 units from cyan and rank 27 fell 1.4,
+# which is the same colour -- because the offset moves which rank collides, not
+# whether one does. Rejecting measures the separation itself instead.
+MIN_SEPARATION = 22.0
+# The threshold gives way rather than the search failing, once the space is
+# full: a threshold no candidate can clear would otherwise loop forever. Colours
+# past that point run closer together because there is no room left, which is a
+# property of the space and not of the rule.
+SEARCH_LIMIT = 60
+RELAXATION = 0.85
+
+def labColour(rgb):
+    """sRGB to CIE-Lab (D65), so separation is judged as an eye judges it.
+
+    Distance in RGB is not perceptual: green fills most of the cube and blue
+    almost none, so two blues nothing can tell apart are far apart in RGB."""
+    def linear(u):
+        return u / 12.92 if u <= 0.04045 else ((u + 0.055) / 1.055) ** 2.4
+    red, green, blue = [linear(u) for u in rgb]
+    x = (0.4124 * red + 0.3576 * green + 0.1805 * blue) / 0.95047
+    y = (0.2126 * red + 0.7152 * green + 0.0722 * blue)
+    z = (0.0193 * red + 0.1192 * green + 0.9505 * blue) / 1.08883
+    def curve(t):
+        return t ** (1.0 / 3.0) if t > 0.008856 else 7.787 * t + 16.0 / 116.0
+    x, y, z = curve(x), curve(y), curve(z)
+    return (116.0 * y - 16.0, 500.0 * (x - y), 200.0 * (y - z))
+
+# The colours handed out so far, with their Lab coordinates, and the next step
+# of the hue sequence to try. Extended on demand and kept: rebuilding the run
+# on every call would compare every rank against every earlier one again.
+ISSUED = list(CAVER_PRIMARIES)
+ISSUED_LAB = [labColour(colour) for colour in CAVER_PRIMARIES]
+NEXT_STEP = [0]
+
 def caverColour(rank):
     """Name of the colour for a 0-based channel rank, registered on first use.
 
-    A pure function of the rank, with no table to run off the end of: a rank is
-    the same colour in every structure and every run, whatever was loaded
-    beside it and however many channels the case turned out to have.
+    A function of the rank, with no table to run off the end of: a rank is the
+    same colour in every structure and every run, whatever was loaded beside it
+    and however many channels the case turned out to have. Only the ranks asked
+    for are generated, and each extends the run the one before it left.
     """
-    if rank < len(CAVER_PRIMARIES):
-        name, rgb = "caver%d" % (rank + 1), CAVER_PRIMARIES[rank]
-    else:
-        step = rank - len(CAVER_PRIMARIES)
-        saturation, value = SATURATION_VALUE[step % len(SATURATION_VALUE)]
-        name = "gen%d" % rank
-        rgb = colorsys.hsv_to_rgb(
-            (HUE_OFFSET + (step + 1) * GOLDEN_ANGLE) % 1.0, saturation, value)
-    cmd.set_color(name, list(rgb))
+    while len(ISSUED) <= rank:
+        threshold, tries = MIN_SEPARATION, 0
+        while True:
+            step = NEXT_STEP[0]
+            NEXT_STEP[0] = step + 1
+            saturation, value = SATURATION_VALUE[step % len(SATURATION_VALUE)]
+            candidate = colorsys.hsv_to_rgb(
+                (HUE_OFFSET + (step + 1) * GOLDEN_ANGLE) % 1.0, saturation, value)
+            lab = labColour(candidate)
+            # Squared, so the comparison needs no square root per pair.
+            limit = threshold * threshold
+            if all((lab[0] - other[0]) ** 2 + (lab[1] - other[1]) ** 2
+                   + (lab[2] - other[2]) ** 2 >= limit for other in ISSUED_LAB):
+                ISSUED.append(candidate)
+                ISSUED_LAB.append(lab)
+                break
+            tries += 1
+            if tries >= SEARCH_LIMIT:
+                threshold *= RELAXATION
+                tries = 0
+
+    name = ("caver%d" % (rank + 1) if rank < len(CAVER_PRIMARIES)
+            else "gen%d" % rank)
+    cmd.set_color(name, list(ISSUED[rank]))
     return name
 '''
 
@@ -11039,6 +11105,164 @@ else:
     cmd.zoom()
     print("Success: Files loaded in perfect sequential order with custom radii!")
 '''
+
+
+#: Source of the PyMOL viewer that :func:`calcChannelsMultipleFrames` leaves
+#: beside the multi-model PQR it writes. Separate from the per-channel viewer
+#: because the file is one object of many states rather than many files, and
+#: because it has to be loaded discretely and is usually too large to load whole.
+_VIS_FRAMES_SCRIPT = r'''"""View the channels of a multi-frame run, one MODEL per frame.
+
+    pymol vis_frames.py
+
+That is the whole invocation: the .pqr and the .pdb are found beside the script.
+To name them, or to change the stride, a `--` is required --
+
+    pymol vis_frames.py -- <channels>.pqr [<protein>.pdb] [stride]
+
+-- because PyMOL loads any file named on its own command line. Without the `--`
+it loads the .pqr a second time, plainly, on top of what this script loaded, and
+that plain copy is exactly what the striding and the discrete load are here to
+avoid. `stride` keeps every nth frame (default 10).
+
+The load is discrete. One frame finds more channels than another, so the models
+hold different numbers of atoms, and PyMOL's plain load folds them into a single
+object with one bond table - the first frame's bonds are then drawn over every
+other frame's atoms and the routes come out as strands running between channels
+that never touched. `discrete=1` keeps each state's own atoms and bonds.
+
+Discrete also means every state is held at once, which is why this strides. A
+thousand frames of one enzyme is some two million atoms, a couple of minutes to
+read and several gigabytes to hold, for a scene showing one state at a time.
+Step through them with the arrow keys, or `mset`/`mplay` to run it.
+"""
+import colorsys
+import os
+import re
+import sys
+import tempfile
+
+import pymol
+from pymol import cmd
+
+''' + _VIS_PALETTE + r'''
+
+# A .py among the arguments is this script's own name, which `pymol -cq` passes
+# through; handing it to cmd.load takes the session down. __file__ is not this
+# file under `pymol script.py`, so the directory comes from pymol.__script__.
+# PyMOL's own flags are in sys.argv too, so anything starting with a dash is
+# not ours to read.
+args = [a for a in sys.argv[1:]
+        if a != '--' and not a.endswith('.py') and not a.startswith('-')]
+here = os.path.dirname(os.path.abspath(getattr(pymol, '__script__', '.'))) or '.'
+
+# PyMOL loads a file named on its own command line, so without the separator it
+# loads the .pqr a second time - plainly, and beside what this script loaded,
+# which is the merged-bond load the discrete one is here to avoid. Said out
+# loud, because the extra states are the only sign of it and they read as this
+# script having loaded ten times too many frames.
+#
+# Not by looking for the '--' itself: PyMOL consumes it, and rewrites sys.argv
+# to the script followed by the arguments after it. Without one, sys.argv is
+# PyMOL's own command line, argv[0] its __init__.py, so argv[0] is what says
+# which happened.
+separated = os.path.basename(sys.argv[0]) == os.path.basename(
+    getattr(pymol, '__script__', sys.argv[0]))
+if args and not separated:
+    print('Careful: %s named without a `--` separator, so PyMOL loads it itself '
+          'as well as this script loading it. Run `pymol vis_frames.py` with no '
+          'arguments, or put `--` before them.' % ', '.join(args))
+
+
+def find(suffix):
+    """A named file of this type, else the only one lying beside the script."""
+    named = [a for a in args if a.endswith(suffix)]
+    if named:
+        return named[0]
+    beside = sorted(f for f in os.listdir(here) if f.endswith(suffix))
+    return os.path.join(here, beside[0]) if beside else None
+
+
+channels = find('.pqr')
+protein = find('.pdb')
+stride = next((int(a) for a in args if a.isdigit()), 10)
+
+if channels is None:
+    print('No .pqr found. Name one: pymol vis_frames.py -- channels.pqr')
+    sys.exit(1)
+
+# Strided into a temporary file rather than loaded and thinned afterwards: the
+# cost this avoids is the reading and the holding, both of which happen at load.
+kept = 0
+handle = tempfile.NamedTemporaryFile('w', suffix='.pqr', delete=False)
+with open(channels) as source:
+    # True until the first MODEL, so the file's own header is carried over, then
+    # only for the frames kept. A channel's REMARK belongs to the model it sits
+    # in and goes with it: carried across regardless, a skipped frame leaves its
+    # channel records describing atoms that are no longer in the file.
+    writing = True
+    for line in source:
+        if line.startswith('MODEL'):
+            writing = (int(line[5:].strip() or 0) % stride == 0)
+            kept += writing
+        if writing:
+            handle.write(line)
+handle.close()
+
+# Named apart from the file, not after it: a stray load of the same .pqr then
+# lands in an object of its own rather than appending its models to these.
+name = re.sub(r'\W+', '_', os.path.splitext(os.path.basename(channels))[0]) + '_frames'
+cmd.load(handle.name, name, discrete=1)
+os.unlink(handle.name)
+cmd.hide('everything', name)
+cmd.show('lines', name)
+
+# Residue number is the channel's own index within its frame, so colouring by it
+# gives one colour per channel and holds that colour across the states.
+residues = set()
+cmd.iterate(name, 'residues.add(int(resi))',
+            space={'residues': residues, 'int': int})
+for residue in sorted(residues):
+    cmd.color(caverColour(residue - 1), '%s and resi %d' % (name, residue))
+
+if protein:
+    structure = os.path.splitext(os.path.basename(protein))[0]
+    cmd.load(protein, structure)
+    cmd.hide('everything', structure)
+    cmd.show('cartoon', structure)
+    cmd.color('grey80', structure)
+    cmd.set('cartoon_transparency', 0.6, structure)
+
+cmd.set('line_width', 1.5)
+cmd.bg_color('white')
+cmd.zoom()
+print('Loaded %d of the frames in %s (every %d), as %d states.'
+      % (kept, os.path.basename(channels), stride, cmd.count_states(name)))
+print('Step through them with the arrow keys, or `mplay` to run it.')
+'''
+
+
+def _writeFramesVisScript(directory):
+    """Leave ``vis_frames.py`` beside a multi-model run, unless already there.
+
+    The multi-model file needs a discrete load and a stride, neither of which a
+    plain `load` gives and neither guessable from what a plain load shows - it
+    draws, it just draws the wrong bonds. Never overwrites, as
+    :func:`_writeVisScript` does not."""
+    import os
+
+    path = os.path.join(str(directory), 'vis_frames.py')
+    if os.path.exists(path):
+        return
+    try:
+        with open(path, 'w') as script_file:
+            script_file.write(_VIS_FRAMES_SCRIPT)
+    except (IOError, OSError) as err:
+        # a viewer that cannot be written is no reason to lose the run
+        _warn("Could not write the PyMOL viewer {0}: {1}".format(path, err))
+    else:
+        LOGGER.info('Wrote the PyMOL viewer {0}. View the run with '
+                    '`pymol vis_frames.py`.'.format(path))
 
 
 def _writeVisScript(directory, pattern='chl*.pqr'):
