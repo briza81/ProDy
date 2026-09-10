@@ -44,17 +44,43 @@ __all__ =['getVmdModel', 'calcChannels', 'calcChannelsMultipleFrames',
 # Van der Waals radii in Angstrom, by element symbol (upper case). The radii the
 # tessellation is built on, and the ones the lining report measures a Voronoi
 # vertex against, so both read them from here.
+# Sources:
+# BD  - Bondi family - J. Phys. Chem. 1964, 68, 441-451.,
+#                      J. Phys. Chem. 1966, 70, 3006.,
+#                      J. Phys. Chem. A 2009, 113, 5806-5812.
+# AZ  - Alvarez - Dalton Trans. 2013, 42, 8617-8636.
+# C&T - Charry and Tkatchenko - J. Chem. Theory Comput. 2024, 20, 7469-7478.
+
 VDW_RADII = {
-    'H': 1.20, 'HE': 1.40, 'LI': 1.82, 'BE': 1.53, 'B': 1.92, 'C': 1.70,
-    'N': 1.55, 'O': 1.52, 'F': 1.47, 'NE': 1.54, 'NA': 2.27, 'MG': 1.73,
-    'AL': 1.84, 'SI': 2.10, 'P': 1.80, 'S': 1.80, 'CL': 1.75, 'AR': 1.88,
-    'K': 2.75, 'CA': 2.31, 'SC': 2.11, 'NI': 1.63, 'CU': 1.40, 'ZN': 1.39,
-    'GA': 1.87, 'GE': 2.11, 'AS': 1.85, 'SE': 1.90, 'BR': 1.85, 'KR': 2.02,
-    'RB': 3.03, 'SR': 2.49, 'PD': 1.63, 'AG': 1.72, 'CD': 1.58, 'IN': 1.93,
-    'SN': 2.17, 'SB': 2.06, 'TE': 2.06, 'I': 1.98, 'XE': 2.16, 'CS': 3.43,
-    'BA': 2.68, 'PT': 1.75, 'AU': 1.66, 'HG': 1.55, 'TL': 1.96, 'PB': 2.02,
-    'BI': 2.07, 'PO': 1.97, 'AT': 2.02, 'RN': 2.20, 'FR': 3.48, 'RA': 2.83,
-    'U': 1.86, 'FE': 2.44,
+    # BD + AZ agree within 0.1 A, or the AZ value is uncertain: keeping BD.
+    # Note that the values for Si, Br and Te are corrections from the later
+    # papers of the BD family.
+    'H': 1.20, 'HE': 1.40, 'B': 1.92, 'C': 1.70, 'N': 1.55, 'O': 1.52, 
+    'F': 1.47, 'NE': 1.54,'NA': 2.27, 'SI': 2.22, 'P': 1.80, 'S': 1.80, 
+    'CL': 1.75, 'AR': 1.88,'K': 2.75, 'GE': 2.11, 'AS': 1.85, 'SE': 1.90, 
+    'BR': 1.83, 'KR': 2.02,'RB': 3.03, 'SB': 2.06, 'TE': 2.00, 'I': 1.98, 
+    'XE': 2.16, 'CS': 3.43,
+
+    # AZ values here, given the known issues of BD: some of its values are
+    # effectively metallic radii, and a bare-atom probe artifact. In ambiguous
+    # cases AZ shows the best agreement with the C&T radii.
+    'LI': 2.12, 'BE': 1.98, 'MG': 2.51, 'AL': 2.25, 'CA': 2.62, 'SC': 2.58, 
+    'TI': 2.46, 'V': 2.42, 'CR': 2.45, 'MN': 2.45, 'FE': 2.44, 'CO': 2.40,
+    'NI': 2.40, 'CU': 2.38, 'ZN': 2.39, 'GA': 2.32, 'SR': 2.84, 'Y': 2.75, 
+    'ZR': 2.52, 'NB': 2.56, 'MO': 2.45, 'TC': 2.44, 'RU': 2.46, 'RH': 2.44,
+    'PD': 2.15, 'AG': 2.53, 'CD': 2.49, 'IN': 2.43, 'SN': 2.42, 'BA': 3.03, 
+    'LA': 2.98, 'CE': 2.88, 'PR': 2.92, 'ND': 2.95, 'SM': 2.90, 'EU': 2.87, 
+    'GD': 2.83, 'TB': 2.79, 'DY': 2.87, 'HO': 2.81, 'ER': 2.83, 'TM': 2.79,
+    'YB': 2.80, 'LU': 2.74, 'HF': 2.63, 'TA': 2.53, 'W': 2.57, 'RE': 2.49, 
+    'OS': 2.48, 'IR': 2.41, 'PT': 2.29, 'AU': 2.32, 'HG': 2.45, 'TL': 2.47, 
+    'PB': 2.60, 'BI': 2.54, 'AC': 2.80, 'TH': 2.93, 'PA': 2.88, 'U': 2.71, 
+    'NP': 2.82, 'PU': 2.81, 'AM': 2.83, 'CM': 3.05, 'BK': 3.40, 'CF': 3.05, 
+    'ES': 2.70,
+
+    # BD only: no contesting reference for these, but the values are likely
+    # underestimated.
+    'PO': 1.97, 'AT': 2.02, 'RN': 2.20, 'FR': 3.48, 'RA': 2.83,
+
     # Not an element: the radius the lining queries fall back on where the table
     # covers no entry, named so that the fallback is visible here rather than
     # buried as a literal at the point of use. 2.0 and not carbon's 1.7 because
