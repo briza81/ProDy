@@ -4126,24 +4126,23 @@ def getChannelAtoms(channels, protein=None, num_samples=5):
     return channels_atomic
 
 
-def _atomRadii(atoms):
-    """``(elements, vdw_radii)`` for *atoms*, from :data:`VDW_RADII`.
+def _atomRadii(atoms, warn=True):
+    """Van der Waals radius of every atom of *atoms*, from :data:`VDW_RADII`.
 
-    An element the table does not cover takes its ``UNKNOWN`` entry instead of
-    raising, and a file that gave no element column at all is read as unknown
-    throughout rather than failing. Both reporting paths measure through here, so
-    a structure that one of them can describe is never one the other dies on.
+    :meth:`ChannelCalculator.getVdwRadii` reading an :class:`.Atomic` rather than
+    a list of symbols, and covering the one case it cannot: a file that gave no
+    element column at all is read as unknown throughout instead of as the string
+    ``None``. Both reporting paths measure through here, so a structure that one
+    of them can describe is never one the other dies on.
 
-    Silent about the fallback: the elements come back with the radii so that a
-    caller can name what it fell back on, and :func:`_liningSource` does that once
-    for the whole report."""
+    *warn* is passed down. A cavity report reads the radii twice, over all the
+    atoms and again over the dry ones, and the substitution is worth saying once
+    rather than twice for what is nearly the same set."""
 
     elements = atoms.getElements()
-    elements = (np.zeros(atoms.numAtoms(), dtype='<U2') if elements is None
-                else np.char.upper(np.asarray(elements, dtype=str)))
-
-    return elements, np.array([VDW_RADII.get(element, VDW_RADII['UNKNOWN'])
-                               for element in elements])
+    if elements is None:
+        elements = np.zeros(atoms.numAtoms(), dtype='<U2')
+    return ChannelCalculator.getVdwRadii(elements, warn=warn)
 
 
 def _vertexRadiiSource(atoms):
@@ -4159,7 +4158,9 @@ def _vertexRadiiSource(atoms):
     if dry is None:
         dry = atoms
 
-    return _kdTree(dry), _atomRadii(dry)[1]
+    # Silent: getSurfaceCavityResidueNames has already measured the same atoms
+    # through _liningSource, which said whatever there was to say about them.
+    return _kdTree(dry), _atomRadii(dry, warn=False)
 
 
 def _vertexRadii(points, source, k=24):
@@ -4190,23 +4191,12 @@ def _liningSource(atoms):
     that it is the same one throughout.
 
     An element the table does not cover falls back on its ``UNKNOWN`` entry rather
-    than raising. The lining is reported against whatever structure the caller
-    passes, which is routinely wider than the selection that was traced - the
-    ions, cofactors and metals the tessellation never saw - and a report is not
-    worth failing over an element whose radius moves one residue in or out. It is
-    said out loud, so that a radius that was guessed is never mistaken for one
-    that was looked up."""
+    than raising, and says so. The lining is reported against whatever structure
+    the caller passes, which is routinely wider than the selection that was traced
+    - the ions, cofactors and metals the tessellation never saw - so it is the
+    report rather than the trace that meets an uncovered element first."""
 
-    elements, radii = _atomRadii(atoms)
-
-    unknown = sorted(set(elements.tolist()) - set(VDW_RADII))
-    if unknown:
-        _warn("No van der Waals radius for {0}; {1} atom(s) are measured with "
-              "the UNKNOWN radius of {2} A instead.".format(
-                  ', '.join(repr(element) for element in unknown),
-                  int(np.isin(elements, unknown).sum()), VDW_RADII['UNKNOWN']))
-
-    return _kdTree(atoms), atoms.getCoords(), radii
+    return _kdTree(atoms), atoms.getCoords(), _atomRadii(atoms)
 
 
 def _liningResidues(atoms, source, points, radii, distA, deep=None):
@@ -6771,13 +6761,32 @@ class ChannelCalculator:
         return simp, neigh, verti
 
     @staticmethod
-    def getVdwRadii(atoms):
+    def getVdwRadii(atoms, warn=True):
         """Van der Waals radius of each element in *atoms*, from :data:`VDW_RADII`.
 
-        A static method, so the radii a diagram would have been built on can be
-        had without a calculator to build one (see :func:`_vertexRadiiSource`)."""
+        *atoms* is a sequence of element symbols, matched case-insensitively. An
+        element the table does not cover takes its ``UNKNOWN`` entry: a structure
+        is tessellated as the caller supplied it, and only water is dropped
+        first, so any ion or cofactor kept in the selection reaches here - a
+        metal outside the table would otherwise stop the trace rather than the
+        report, which is the wrong end to fail at. The substitution is announced
+        unless *warn* is false, for callers that have already said it themselves.
 
-        return np.array([VDW_RADII[atom] for atom in atoms])
+        A static method, so the radii a diagram would have been built on can be
+        had without a calculator to build one (see :func:`_atomRadii`)."""
+
+        elements = np.char.upper(np.asarray(atoms, dtype=str))
+        if warn:
+            unknown = sorted(set(elements.tolist()) - set(VDW_RADII))
+            if unknown:
+                _warn("No van der Waals radius for {0}; {1} atom(s) are "
+                      "measured with the UNKNOWN radius of {2} A instead."
+                      .format(', '.join(repr(element) for element in unknown),
+                              int(np.isin(elements, unknown).sum()),
+                              VDW_RADII['UNKNOWN']))
+
+        return np.array([VDW_RADII.get(element, VDW_RADII['UNKNOWN'])
+                         for element in elements])
 
     def _fibonacciSphere(self, n):
         """Return ``n`` roughly evenly distributed unit vectors on a sphere using
