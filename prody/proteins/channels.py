@@ -2705,38 +2705,27 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
                     "how the first kind connect.".format(
                         sealed, '' if sealed == 1 else 's', bottleneck))
 
-    if output_path and _isMmcifFormat(output_format, separate):
+    if output_path and not (channels or links):
+        # Nothing found, so nothing is written - no file, and no viewer for a
+        # file that is not there. An empty file would say only that a run
+        # happened, which the count reported above already says, and it cannot
+        # be told apart from a run that failed while writing. What an earlier run
+        # left behind is worth a word, though: it survives now, and goes on
+        # looking like this run's output.
+        _warnStaleOutputs(output_path, output_format, separate)
+
+    elif output_path and _isMmcifFormat(output_format, separate):
         written = writeChannelsCIF(output_path, channels, atoms, links=links,
                                    auto=start_point is None)
         # As on the PQR path: only for a run told a directory. Told a file, the
         # parent is usually the working directory, and a run has no business
         # leaving a script there.
-        if Path(output_path).is_dir():
+        if written and Path(output_path).is_dir():
             _writeVisScript(Path(written).parent, Path(written).name)
 
     elif output_path:
-        output_path = Path(output_path)
-
-        # A directory names no run, so nothing here is named after one: the
-        # files are named after what they hold, channels.pqr beside links.pqr,
-        # and the per-object files carry no stem either - sp0_chl3.pqr rather
-        # than output_sp0_chl3.pqr, a stem that would be the same word for every
-        # run and so tell the reader nothing.
-        into_directory = output_path.is_dir()
-        separate_stem = None
-        if into_directory:
-            output_path = output_path / "channels.pqr"
-            separate_stem = ''
-
-        elif not (output_path.suffix == ".pdb" or output_path.suffix == ".pqr"):
-            output_path = output_path.with_suffix(".pqr")
-
-        # Beside the channels rather than among them: a link does not reach
-        # the surface, so a viewer loading the channel file should not find
-        # one in it.
-        links_path = output_path.with_name(
-            ('links' if into_directory else output_path.stem + '_links')
-            + output_path.suffix)
+        output_path, links_path, into_directory, separate_stem = \
+            _pqrOutputPaths(output_path)
 
         # One line for the whole of what was written, so that the reader sees
         # where the channels went and where the links went in one place.
@@ -3000,7 +2989,18 @@ def calcPoresFromChannels(channels, details, min_end_to_end=None, max_end_to_end
         pore = Channel(pore_path, centerline_spline, radius_spline, length, bottleneck, volume, 0.0)
         pores.append(pore)
     
-    if output_path and _isMmcifFormat(output_format, separate):
+    if output_path and not pores:
+        # As in calcChannels: no pores, no file - and a word about whatever an
+        # earlier run left at the same place. Pores are named apart from
+        # channels, so the tag globbed for and the mmCIF name are the pore ones.
+        # Through both resolvers, in the order the writing path applies them:
+        # _poreCifPath picks the name inside a directory, and writeChannelsCIF
+        # then adds the suffix. Checking only the first would look for `out`
+        # where `out.cif` was written.
+        _warnStaleOutputs(output_path, output_format, separate, tags=('pore',),
+                          cif_path=_cifOutputPath(_poreCifPath(output_path)))
+
+    elif output_path and _isMmcifFormat(output_format, separate):
         # A directory takes pores.cif rather than channels.cif, for the same
         # reason the PQR path names them apart: a run writing both into one
         # folder would otherwise have the second overwrite the first.
@@ -6587,6 +6587,89 @@ def _cifLoop(out, category, columns, rows, precision=None):
             for column in columns) + '\n')
 
 
+def _pqrOutputPaths(output_path):
+    """``(channels_path, links_path, into_directory, separate_stem)`` for a PQR run.
+
+    A directory names no run, so nothing here is named after one: the files are
+    named after what they hold, ``channels.pqr`` beside ``links.pqr``, and the
+    per-object files carry no stem either - ``sp0_chl3.pqr`` rather than
+    ``output_sp0_chl3.pqr``, a stem that would be the same word for every run and
+    so tell the reader nothing.
+
+    Links go beside the channels rather than among them: a link does not reach the
+    surface, so a viewer loading the channel file should not find one in it.
+
+    Split out so that the run which writes these files and the check for stale ones
+    left by an earlier run resolve them the same way. Two copies of this would
+    disagree eventually, and the disagreement would be a warning about the wrong
+    file, or no warning at all."""
+
+    from pathlib import Path
+
+    output_path = Path(output_path)
+
+    into_directory = output_path.is_dir()
+    separate_stem = None
+    if into_directory:
+        output_path = output_path / "channels.pqr"
+        separate_stem = ''
+
+    elif not (output_path.suffix == ".pdb" or output_path.suffix == ".pqr"):
+        output_path = output_path.with_suffix(".pqr")
+
+    links_path = output_path.with_name(
+        ('links' if into_directory else output_path.stem + '_links')
+        + output_path.suffix)
+
+    return output_path, links_path, into_directory, separate_stem
+
+
+def _warnStaleOutputs(output_path, output_format='pqr', separate=False,
+                      tags=('chl', 'lnk'), cif_path=None):
+    """Name the files an earlier run left where this one has just written nothing.
+
+    A run that finds nothing now leaves no file at all, which is right - an empty
+    one cannot be told from a write that failed. It does mean an older file at the
+    same place survives and goes on looking like this run's output, and that is
+    worse than an empty file, because it is wrong rather than merely uninformative.
+    So the paths are resolved exactly as a writing run would resolve them, and
+    whatever is already there is named.
+
+    The per-object files cannot be listed from a run that produced none, so they are
+    globbed by the tag they carry in their names instead."""
+
+    from pathlib import Path
+
+    if not output_path:
+        return
+
+    stale = []
+    if _isMmcifFormat(output_format, separate=False):
+        path = _cifOutputPath(output_path) if cif_path is None else Path(cif_path)
+        if path.exists():
+            stale.append(path)
+    else:
+        channels_path, links_path, into_directory, _ = \
+            _pqrOutputPaths(output_path)
+        stale.extend(p for p in (channels_path, links_path) if p.exists())
+
+        if separate:
+            prefix = '' if into_directory else channels_path.stem + '_'
+            for tag in tags:
+                stale.extend(sorted(channels_path.parent.glob(
+                    '{0}*{1}*{2}'.format(prefix, tag, channels_path.suffix))))
+
+    if not stale:
+        return
+
+    stale = sorted(set(str(p) for p in stale))
+    _warn("Nothing was found, so nothing was written, but {0} file(s) from an "
+          "earlier run are still there and now describe no run at all: {1}{2}. "
+          "Delete them, or write this run somewhere else.".format(
+              len(stale), ', '.join(stale[:6]),
+              ', ...' if len(stale) > 6 else ''))
+
+
 def _cifOutputPath(path):
     """Resolve *path* to the file the mmCIF is written to.
 
@@ -7114,6 +7197,13 @@ def writeChannelsCIF(filename, channels, atoms=None, structure=None, links=None,
                 context, num_samples)
             for category, values in produced.items():
                 rows[category].extend(values)
+
+    if not rows['channel']:
+        # Nothing traced, so no file: a block holding only its own audit record
+        # says a run happened and nothing else, and a reader cannot tell it from
+        # a file whose channels failed to write. The count is already reported by
+        # the caller. Returns None rather than a name nothing is under.
+        return None
 
     if atoms is not None:
         # Once for the file, not once per object: a cofactor sitting in several
@@ -9598,6 +9688,13 @@ class ChannelCalculator:
         # REMARKs. It tells the objects of one search site apart from another's,
         # so it says nothing at all when the run had a single site: there every
         # channel would carry the same sp0, which is clutter and not a label.
+        # Nothing found, nothing written - not even the empty file that opening
+        # for writing would leave, which says only that something ran and cannot
+        # be told apart from a write that failed halfway. The count the run found
+        # is already reported by the caller.
+        if not channels:
+            return
+
         filename = str(filename)
         separate_path = str(separate_path) if separate_path else filename
 
@@ -9734,6 +9831,12 @@ class ChannelCalculator:
             if tetrahedra is None or len(tetrahedra) == 0:
                 continue
             drawn.append((len(drawn), cavity, vertices[tetrahedra]))
+
+        # As in saveChannelsToPdb: nothing to draw, nothing written. Tested on
+        # what is actually drawn rather than on the cavities given, since a
+        # cavity with no tetrahedra contributes no atoms either.
+        if not drawn:
+            return
 
         with open(filename, 'w') as pqr_file:
             atom_index = 1
