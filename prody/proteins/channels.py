@@ -3386,8 +3386,14 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         if isinstance(trajectory, Atomic):
             trajectory = Ensemble(trajectory)
 
-        nfi = trajectory._nfi
-        trajectory.reset()
+        # `_nfi` is a DCD read cursor, so only a file-backed trajectory has one;
+        # an Ensemble holds its coordinates in memory and has nothing to rewind.
+        # Reading it unguarded made every in-memory input raise, the conversion
+        # just above included - the one branch written to accept an Atomic turned
+        # it into the very type that could not survive the next line.
+        nfi = getattr(trajectory, '_nfi', None)
+        if hasattr(trajectory, 'reset'):
+            trajectory.reset()
 
         first, last = _frameBounds(None, start_frame, stop_frame)
         traj = trajectory[first:last]
@@ -3402,7 +3408,8 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
             
             tasks.append((j0, atoms_copy, np.array(frame0.getCoords(), copy=True),
                             frame_output_path, separate, start_point, return_details, kwargs))
-        trajectory._nfi = nfi
+        if nfi is not None:
+            trajectory._nfi = nfi
 
     else:
         if atoms.numCoordsets() > 1:
@@ -3561,9 +3568,12 @@ def calcSurfaceCavitiesMultipleFrames(atoms, trajectory=None, output_path=None,
         if isinstance(trajectory, Atomic):
             trajectory = Ensemble(trajectory)
 
-        nfi = trajectory._nfi
-        trajectory.reset()
-        
+        # As in calcChannelsMultipleFrames: only a file-backed trajectory carries
+        # a read cursor, and an in-memory one has nothing to save or rewind.
+        nfi = getattr(trajectory, '_nfi', None)
+        if hasattr(trajectory, 'reset'):
+            trajectory.reset()
+
         first, last = _frameBounds(None, start_frame, stop_frame)
         traj = trajectory[first:last]
 
@@ -3578,7 +3588,8 @@ def calcSurfaceCavitiesMultipleFrames(atoms, trajectory=None, output_path=None,
             tasks.append((j0, atoms_copy, np.array(frame0.getCoords(), copy=True),
                           frame_output_path, separate, kwargs))
 
-        trajectory._nfi = nfi
+        if nfi is not None:
+            trajectory._nfi = nfi
 
     else:
         if atoms.numCoordsets() > 1:
