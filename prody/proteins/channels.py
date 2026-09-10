@@ -260,6 +260,47 @@ def _numberedPath(filename, tag, index, suffix='', stem=None):
         stem + '_' if stem else '', tag, index, suffix, path.suffix))
 
 
+def _frameBounds(n_frames, start_frame=0, stop_frame=-1):
+    """Half-open ``[first, last)`` over the 0-based frames a run covers.
+
+    The one definition of what ``start_frame`` and ``stop_frame`` mean, because
+    having several was how they came to disagree. ``stop_frame`` is **inclusive** -
+    the last frame analysed, as every docstring in this module says - and ``-1``
+    means "through the last one". Frames are numbered from 0, matching
+    :meth:`~.AtomGroup.setACSIndex` and :meth:`~.AtomGroup.getCoordsets`; note that
+    a multi-model PDB numbers its ``MODEL`` records from 1, so ``stop_frame=0`` is
+    ``MODEL 1``.
+
+    *n_frames* is how many there are, or ``None`` where that is not known yet - a
+    trajectory read frame by frame - in which case ``last`` comes back ``None``,
+    which slices to the end just as an omitted bound does.
+
+    The reason this exists rather than a slice at each call site: ``-1`` is a
+    sentinel here, but it is also a perfectly good Python index, and
+    ``coordsets[start:-1]`` therefore silently drops the last frame instead of
+    keeping all of them. A slice is also exclusive where this API is inclusive, so
+    the same expression is off by one again for every other value. Both mistakes
+    read as correct code, which is why they lasted.
+
+    An out-of-range *stop_frame* is clamped rather than raising: callers wrote
+    ``stop_frame=atoms.numCoordsets()`` to work around the exclusive behaviour, and
+    that should keep meaning "all of them" rather than becoming an IndexError."""
+
+    first = max(0, int(start_frame))
+
+    if stop_frame is None or int(stop_frame) < 0:
+        last = n_frames
+    else:
+        last = int(stop_frame) + 1
+        if n_frames is not None:
+            last = min(last, n_frames)
+
+    if last is not None and last < first:
+        last = first
+
+    return first, last
+
+
 def _frameOutputPath(output_path, index, name, suffix='.pqr'):
     """Where one frame of a multi-frame run writes.
 
@@ -3348,13 +3389,11 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         nfi = trajectory._nfi
         trajectory.reset()
 
-        if stop_frame == -1:
-            traj = trajectory[start_frame:]
-        else:
-            traj = trajectory[start_frame:stop_frame+1]
-        
+        first, last = _frameBounds(None, start_frame, stop_frame)
+        traj = trajectory[first:last]
+
         atoms_copy = atoms.copy()
-        for j0, frame0 in enumerate(traj, start=start_frame):
+        for j0, frame0 in enumerate(traj, start=first):
             if output_path:
                 frame_output_path = _frameOutputPath(output_path, j0, "channels",
                                                      frame_suffix)
@@ -3368,8 +3407,8 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
     else:
         if atoms.numCoordsets() > 1:
             coordsets = atoms.getCoordsets()
-            for i in range(len(atoms.getCoordsets()[start_frame:stop_frame])):
-                model_nr = i + start_frame
+            first, last = _frameBounds(len(coordsets), start_frame, stop_frame)
+            for model_nr in range(first, last):
 
                 if output_path:
                     frame_output_path = _frameOutputPath(output_path, model_nr,
@@ -3525,13 +3564,11 @@ def calcSurfaceCavitiesMultipleFrames(atoms, trajectory=None, output_path=None,
         nfi = trajectory._nfi
         trajectory.reset()
         
-        if stop_frame == -1:
-            traj = trajectory[start_frame:]
-        else:
-            traj = trajectory[start_frame:stop_frame + 1]
+        first, last = _frameBounds(None, start_frame, stop_frame)
+        traj = trajectory[first:last]
 
         atoms_copy = atoms.copy()
-        for j0, frame0 in enumerate(traj, start=start_frame):
+        for j0, frame0 in enumerate(traj, start=first):
             if output_path:
                 frame_output_path = _frameOutputPath(output_path, j0,
                                                      "cavities")
@@ -3547,12 +3584,9 @@ def calcSurfaceCavitiesMultipleFrames(atoms, trajectory=None, output_path=None,
         if atoms.numCoordsets() > 1:
             coordsets = atoms.getCoordsets()
 
-            if stop_frame == -1:
-                model_indices = range(start_frame, len(coordsets))
-            else:
-                model_indices = range(start_frame, stop_frame + 1)
+            first, last = _frameBounds(len(coordsets), start_frame, stop_frame)
 
-            for i in model_indices:
+            for i in range(first, last):
                 if output_path:
                     frame_output_path = _frameOutputPath(output_path, i,
                                                          "cavities")
@@ -4787,12 +4821,13 @@ def getObjectResidueNamesMultipleFrames(atoms, objects_all, trajectory=None, obj
         raise ValueError("object_type must be 'channel', 'pore' or 'link'")
 
     if trajectory is None:
-        # multi-model PDB
-        for frame_pos, objects in enumerate(objects_all):
-            model_index = start_frame + frame_pos
-
-            if stop_frame != -1 and model_index > stop_frame:
-                break
+        # multi-model PDB. objects_all is already one entry per analysed frame,
+        # numbered from start_frame, so the bounds are taken over the labels
+        # rather than over the list.
+        first, last = _frameBounds(start_frame + len(objects_all),
+                                   start_frame, stop_frame)
+        for model_index in range(first, last):
+            objects = objects_all[model_index - first]
 
             LOGGER.info("Model: {0}".format(model_index))
             atoms.setACSIndex(model_index)
@@ -4818,14 +4853,12 @@ def getObjectResidueNamesMultipleFrames(atoms, objects_all, trajectory=None, obj
         if hasattr(trajectory, 'reset'):
             trajectory.reset()
 
-        if stop_frame == -1:
-            traj = trajectory[start_frame:]
-        else:
-            traj = trajectory[start_frame:stop_frame + 1]
+        first, last = _frameBounds(None, start_frame, stop_frame)
+        traj = trajectory[first:last]
 
         atoms_copy = atoms.copy()
         for frame_pos, frame in enumerate(traj):
-            frame_index = start_frame + frame_pos
+            frame_index = first + frame_pos
 
             if frame_pos >= len(objects_all):
                 break
@@ -5345,15 +5378,23 @@ def getSurfaceCavityResidueNamesMultipleFrames(atoms, cavities_all,
     :type include_chain: bool  """
 
     start_frame = kwargs.pop('start_frame', 0)
+    # Popped and honoured rather than left in kwargs: the docstring has always
+    # documented it, but it was neither read here nor accepted by the per-frame
+    # report it was forwarded to.
+    stop_frame = kwargs.pop('stop_frame', -1)
     residues_file_name = kwargs.pop('residues_file_name', None)
 
     selected_residues_all = []
-    
+
     if trajectory is None:
-        # multi-model PDB
-        for frame_pos, (cavities, surface) in enumerate(zip(cavities_all, 
-                                                            surfaces_all)):
-            model_index = start_frame + frame_pos
+        # multi-model PDB. As in getObjectResidueNamesMultipleFrames, the lists
+        # already hold one entry per analysed frame, numbered from start_frame.
+        available = min(len(cavities_all), len(surfaces_all))
+        first, last = _frameBounds(start_frame + available, start_frame,
+                                   stop_frame)
+        for model_index in range(first, last):
+            cavities = cavities_all[model_index - first]
+            surface = surfaces_all[model_index - first]
             atoms.setACSIndex(model_index)
 
             if residues_file_name is not None:
@@ -5371,9 +5412,16 @@ def getSurfaceCavityResidueNamesMultipleFrames(atoms, cavities_all,
         if hasattr(trajectory, 'reset'):
             trajectory.reset()
 
+        first, last = _frameBounds(None, start_frame, stop_frame)
         atoms_copy = atoms.copy()
-        for frame_pos, frame in enumerate(trajectory):
-            frame_index = start_frame + frame_pos
+        for frame_pos, frame in enumerate(trajectory[first:last]):
+            # The frames outlast the results whenever the trajectory is longer
+            # than the run that produced them, and indexing past the end of the
+            # lists would raise rather than stop.
+            if frame_pos >= min(len(cavities_all), len(surfaces_all)):
+                break
+
+            frame_index = first + frame_pos
             atoms_copy.setCoords(frame.getCoords())
 
             if residues_file_name is not None:
