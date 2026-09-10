@@ -4126,6 +4126,26 @@ def getChannelAtoms(channels, protein=None, num_samples=5):
     return channels_atomic
 
 
+def _atomRadii(atoms):
+    """``(elements, vdw_radii)`` for *atoms*, from :data:`VDW_RADII`.
+
+    An element the table does not cover takes its ``UNKNOWN`` entry instead of
+    raising, and a file that gave no element column at all is read as unknown
+    throughout rather than failing. Both reporting paths measure through here, so
+    a structure that one of them can describe is never one the other dies on.
+
+    Silent about the fallback: the elements come back with the radii so that a
+    caller can name what it fell back on, and :func:`_liningSource` does that once
+    for the whole report."""
+
+    elements = atoms.getElements()
+    elements = (np.zeros(atoms.numAtoms(), dtype='<U2') if elements is None
+                else np.char.upper(np.asarray(elements, dtype=str)))
+
+    return elements, np.array([VDW_RADII.get(element, VDW_RADII['UNKNOWN'])
+                               for element in elements])
+
+
 def _vertexRadiiSource(atoms):
     """``(tree, vdw_radii)`` over the atoms a tessellation would have used.
 
@@ -4139,9 +4159,7 @@ def _vertexRadiiSource(atoms):
     if dry is None:
         dry = atoms
 
-    vdw = ChannelCalculator.getVdwRadii(
-        np.char.upper(np.asarray(dry.getElements(), dtype=str)))
-    return _kdTree(dry), vdw
+    return _kdTree(dry), _atomRadii(dry)[1]
 
 
 def _vertexRadii(points, source, k=24):
@@ -4179,9 +4197,7 @@ def _liningSource(atoms):
     said out loud, so that a radius that was guessed is never mistaken for one
     that was looked up."""
 
-    elements = atoms.getElements()
-    elements = (np.zeros(atoms.numAtoms(), dtype='<U2') if elements is None
-                else np.char.upper(np.asarray(elements, dtype=str)))
+    elements, radii = _atomRadii(atoms)
 
     unknown = sorted(set(elements.tolist()) - set(VDW_RADII))
     if unknown:
@@ -4190,8 +4206,6 @@ def _liningSource(atoms):
                   ', '.join(repr(element) for element in unknown),
                   int(np.isin(elements, unknown).sum()), VDW_RADII['UNKNOWN']))
 
-    radii = np.array([VDW_RADII.get(element, VDW_RADII['UNKNOWN'])
-                      for element in elements])
     return _kdTree(atoms), atoms.getCoords(), radii
 
 
@@ -5027,7 +5041,6 @@ def getSurfaceCavityResidueNames(atoms, cavities, surface, **kwargs):
     source = _liningSource(atoms)
     radii_source = _vertexRadiiSource(atoms)
     intruding = 0
-    deep = {}
 
     for i, cavity in enumerate(cavities):
         if cavity.tetrahedra is None or len(cavity.tetrahedra) == 0:
@@ -5035,10 +5048,15 @@ def getSurfaceCavityResidueNames(atoms, cavities, surface, **kwargs):
             continue
 
         points = vertices[cavity.tetrahedra]
+        # No deep-atom accounting here, unlike the object reports: a cavity keeps
+        # no radius of its own, so the probe is _vertexRadii's min over the very
+        # atoms being reported, and the gap to the atom holding that minimum is
+        # identically zero. Nothing can lie inside a probe fitted around it. The
+        # intruding count below is the signal that survives, a vertex swallowed
+        # whole rather than an atom reaching into the route.
         radii = _vertexRadii(points, radii_source)
         intruding += int((radii < 0).sum())
-        residues = _liningResidues(atoms, source, points, radii, options.distA,
-                                   deep)
+        residues = _liningResidues(atoms, source, points, radii, options.distA)
 
         residues_info = _formatLiningResidues(residues, options)
         residues_list = ", ".join(residues_info) if residues_info else "None"
@@ -5051,10 +5069,6 @@ def getSurfaceCavityResidueNames(atoms, cavities, surface, **kwargs):
               "The cavities were calculated on a different set of atoms than the "
               "one given here, so their lining is reported against the wrong "
               "structure.".format(intruding))
-
-    # Names them, where the count above only counts; the two read the same
-    # geometry from opposite ends, the vertex radius and the lining gap.
-    _reportDeepLiningAtoms(atoms, deep)
 
     if options.residues_file_name is not None:
         output_file = options.residues_file_name + '_Residues_All_surface_cavities.txt'
