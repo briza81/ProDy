@@ -54,7 +54,15 @@ VDW_RADII = {
     'SN': 2.17, 'SB': 2.06, 'TE': 2.06, 'I': 1.98, 'XE': 2.16, 'CS': 3.43,
     'BA': 2.68, 'PT': 1.75, 'AU': 1.66, 'HG': 1.55, 'TL': 1.96, 'PB': 2.02,
     'BI': 2.07, 'PO': 1.97, 'AT': 2.02, 'RN': 2.20, 'FR': 3.48, 'RA': 2.83,
-    'U': 1.86, 'FE': 2.44
+    'U': 1.86, 'FE': 2.44,
+    # Not an element: the radius the lining queries fall back on where the table
+    # covers no entry, named so that the fallback is visible here rather than
+    # buried as a literal at the point of use. 2.0 and not carbon's 1.7 because
+    # what is missing is metals - the entries above are Bondi 1964 plus the
+    # Mantina 2009 main-group extension, which between them reach the main group
+    # and Bondi's short list of noble metals and no further, so a transition
+    # metal is the likelier of the two guesses.
+    'UNKNOWN': 2.00
 }
 
 _OVERLAP_OFFSET_CACHE = {}
@@ -4153,37 +4161,151 @@ def _vertexRadii(points, source, k=24):
     return (distances - vdw[indices]).min(axis=1)
 
 
-def _liningResidues(atoms, tree, points, radii, distA):
-    """Whole residues of *atoms* reaching within *distA* of the probe surface.
+def _liningSource(atoms):
+    """``(tree, coords, vdw_radii)`` for the lining queries over *atoms*.
+
+    The radii come from :data:`VDW_RADII`, the table :func:`calcChannels`
+    tessellates with, so the clearance the lining measures is a clearance from
+    the surface the channel was actually carved against, and not from some other
+    scale's idea of the same atom. Several such scales exist and they disagree by
+    more than the distance being measured, so which one is used matters less than
+    that it is the same one throughout.
+
+    An element the table does not cover falls back on its ``UNKNOWN`` entry rather
+    than raising. The lining is reported against whatever structure the caller
+    passes, which is routinely wider than the selection that was traced - the
+    ions, cofactors and metals the tessellation never saw - and a report is not
+    worth failing over an element whose radius moves one residue in or out. It is
+    said out loud, so that a radius that was guessed is never mistaken for one
+    that was looked up."""
+
+    elements = atoms.getElements()
+    elements = (np.zeros(atoms.numAtoms(), dtype='<U2') if elements is None
+                else np.char.upper(np.asarray(elements, dtype=str)))
+
+    unknown = sorted(set(elements.tolist()) - set(VDW_RADII))
+    if unknown:
+        _warn("No van der Waals radius for {0}; {1} atom(s) are measured with "
+              "the UNKNOWN radius of {2} A instead.".format(
+                  ', '.join(repr(element) for element in unknown),
+                  int(np.isin(elements, unknown).sum()), VDW_RADII['UNKNOWN']))
+
+    radii = np.array([VDW_RADII.get(element, VDW_RADII['UNKNOWN'])
+                      for element in elements])
+    return _kdTree(atoms), atoms.getCoords(), radii
+
+
+def _liningResidues(atoms, source, points, radii, distA, deep=None):
+    """Whole residues of *atoms* whose surface comes within *distA* of the probe's.
 
     The probe spheres are given by *points* and *radii*, and a residue lines the
-    object when one of its atoms falls within ``radii + distA`` of a probe centre.
-    The radius belongs in the criterion because the probe is a sphere and not a
-    point: measured from the centre alone a fixed *distA* reaches only ``distA - r``
-    past the surface, so it gathers a second shell where the object is narrow and
-    misses the wall where it is wide. Two thirds of the vertices of the default
-    surface cavities of 3A2M have their nearest wall atom beyond 4 A, and the
-    residues lining that volume were absent from the report altogether.
+    object when one of its atoms satisfies ``|x_p - x_a| - r_p - r_a <= distA`` -
+    the gap between the two surfaces. Both radii belong in it.
+
+    The probe radius, because the probe is a sphere and not a point: measured from
+    its centre a fixed *distA* reaches only ``distA - r_p`` past the surface, so it
+    gathers a second shell where the object is narrow and misses the wall where it
+    is wide.
+
+    The atom radius, because without it the reach past an atom's *own* surface is
+    ``distA - r_a``, which varies with the element. It is widest at a hydrogen,
+    narrower at every heavy atom, and negative for the alkali and alkaline-earth
+    ions, which then have to overlap the probe before being reported at all.
+    Whole-residue completion hides that wherever a residue is polyatomic, one
+    qualifying atom carrying the rest, and leaves it exposed for exactly the
+    monatomic species a lining report exists to name. It also made the criterion
+    depend on whether the depositor modelled hydrogens, a hydrogen being the
+    element the missing term favours most.
+
+    *source* is a :func:`_liningSource` bundle and not something derived from
+    *atoms* here, because the reports call this once per object against one
+    structure: on a large structure, building the tree and the radii again per
+    object costs more than the query it serves.
+
+    *deep* is an optional dict, updated in place with the atoms lying inside the
+    route rather than beside it; :func:`_reportDeepLiningAtoms` reads it.
 
     Residues are completed but never widened past what the caller supplied, which
     is what the ``same residue as`` selection this replaces also did."""
 
-    if len(points) == 0:
+    tree, coords, atom_radii = source
+    points = np.asarray(points, dtype=float)
+    radii = np.asarray(radii, dtype=float)
+
+    if len(points) == 0 or len(coords) == 0:
         return None
 
-    hits = tree.query_ball_point(np.asarray(points, dtype=float),
-                                 np.asarray(radii, dtype=float) + distA)
-    hits = [h for h in hits if len(h)]
-    if not hits:
+    # A radius query and not a k-nearest one: a fixed k truncates wherever the
+    # wall is denser than the k it was chosen for, and the neighbours it drops
+    # are the far ones the criterion is deciding on. query_ball_point takes no
+    # per-neighbour radius, so the search is widened by the largest van der Waals
+    # radius present and the candidates are then held to their own.
+    hits = tree.query_ball_point(points,
+                                 radii + distA + float(atom_radii.max()))
+    counts = np.fromiter((len(hit) for hit in hits), dtype=int, count=len(hits))
+    if not counts.any():
+        return None
+
+    # One flat (probe, candidate) list, so the exact gap is a single vectorized
+    # pass rather than a per-probe one; the widened query leaves few candidates
+    # to reject, and none to add.
+    candidates = np.fromiter((atom for hit in hits for atom in hit),
+                             dtype=int, count=int(counts.sum()))
+    probes = np.repeat(np.arange(len(points)), counts)
+    gaps = (np.linalg.norm(points[probes] - coords[candidates], axis=1)
+            - radii[probes] - atom_radii[candidates])
+
+    if deep is not None:
+        # A probe sphere is inscribed in the atoms the tessellation was built
+        # from, so against those it cannot overlap one. The spheres are read off
+        # the spline rather than off the Voronoi vertices, though, so a probe
+        # overshoots its inscribed sphere by a little and clips the wall. This
+        # floor sits well above that overshoot and far below a real overlap, so
+        # what it collects is only atoms the tessellation never saw.
+        inside = gaps < -0.5
+        for atom, gap in zip(candidates[inside].tolist(), gaps[inside].tolist()):
+            if gap < deep.get(atom, 0.0):
+                deep[atom] = gap
+
+    within = gaps <= distA
+    if not within.any():
         return None
 
     resindices = atoms.getResindices()
-    lining = np.unique(resindices[np.unique(np.concatenate(hits))])
+    lining = np.unique(resindices[np.unique(candidates[within])])
     selected = np.flatnonzero(np.isin(resindices, lining))
 
     if hasattr(atoms, 'getAtomGroup'):   # a selection: index back into its group
         return atoms.getAtomGroup()[atoms.getIndices()[selected].tolist()]
     return atoms[selected.tolist()]
+
+
+def _reportDeepLiningAtoms(atoms, deep):
+    """Name the residues lying inside the route rather than beside it.
+
+    *deep* is what :func:`_liningResidues` collected. These are atoms the
+    tessellation never saw: an ion or a cofactor sitting in the route, which is a
+    result worth having and is what measuring to the atom centre was most likely
+    to miss, or a structure that is not the one the channels were traced on, which
+    is not. Geometry cannot tell the two apart - a permeant ion and a mismatched
+    structure overlap the route alike - so this states what was found and leaves
+    the reading to the caller, rather than warning about a mismatch that is
+    usually a ligand."""
+
+    if not deep:
+        return
+
+    indices = np.fromiter(deep, dtype=int, count=len(deep))
+    resnames, resnums = atoms.getResnames(), atoms.getResnums()
+    _, first = np.unique(atoms.getResindices()[indices], return_index=True)
+    labels = ['{0}{1}'.format(resnames[i], resnums[i])
+              for i in indices[first].tolist()]
+
+    LOGGER.info("{0} residue(s) lie inside the route rather than beside it "
+                "({1}), reaching {2:.2f} A past its surface. These atoms were "
+                "not part of the tessellation the channels came from.".format(
+                    len(labels), ', '.join(labels[:8]) +
+                    (', ...' if len(labels) > 8 else ''), -min(deep.values())))
 
 
 def _oneLetterResname(residue):
@@ -4236,7 +4358,7 @@ def _popLiningOptions(kwargs):
     once here instead of in two lists that have to be kept in step."""
 
     return _LiningOptions(
-        distA=kwargs.pop('distA', 2.5),
+        distA=kwargs.pop('distA', 1.5),
         residues_file_name=kwargs.pop('residues_file_name', None),
         one_letter_aa=kwargs.pop('one_letter_aa', False),
         include_water=kwargs.pop('include_water', False),
@@ -4291,8 +4413,9 @@ def _formatLiningResidues(residues, options):
 
 def getObjectResidueNames(atoms, objects, object_type='channel', **kwargs):
     '''Provides the resnames and resid of residues that are forming the object(s). 
-    Residues are extracted based on distA which is the distance between FIL atoms 
-    (object atoms) and protein residues.
+    Residues are extracted based on distA, the clearance between the surface of
+    the FIL atoms (object atoms) and the van der Waals surface of the residue's
+    own atoms.
     Results could be save as txt file by providing the `residues_file_name` parameter.
     
     :arg atoms: an Atomic object from which residues are selected 
@@ -4308,10 +4431,11 @@ def getObjectResidueNames(atoms, objects, object_type='channel', **kwargs):
     :type object_type: str
 
     :arg distA: Residues reaching within this distance of the object's surface
-        are reported. The local probe radius is added to it, so the reach past
-        the surface is the same in a wide part of the object as in a narrow one.
-        The distance runs to the atom centre, so a touching atom sits at about
-        one van der Waals radius. Default is 2.5 [Ang]
+        are reported. It is a clearance between surfaces: the local probe radius
+        and the atom's van der Waals radius are both taken off, so a touching
+        atom sits at 0 and the reach is the same in a wide part of the object as
+        in a narrow one, and the same at a hydrogen as at a potassium ion.
+        Default is 1.5 [Ang]
     :type distA: int, float
     
     :arg residues_file_name: The file with residues will be saved in a text 
@@ -4347,7 +4471,8 @@ def getObjectResidueNames(atoms, objects, object_type='channel', **kwargs):
 
     options = _popLiningOptions(kwargs)
 
-    tree = _kdTree(atoms)
+    source = _liningSource(atoms)
+    deep = {}
 
     if isinstance(objects, list):
         # Multiple objects
@@ -4355,7 +4480,8 @@ def getObjectResidueNames(atoms, objects, object_type='channel', **kwargs):
 
         for i, object in enumerate(objects):
             points, radii = _sampleObjectSpheres(object)
-            residues = _liningResidues(atoms, tree, points, radii, options.distA)
+            residues = _liningResidues(atoms, source, points, radii,
+                                       options.distA, deep)
             residues_info = _formatLiningResidues(residues, options)
 
             # An object with no lining left is reported as "None" rather than
@@ -4367,9 +4493,14 @@ def getObjectResidueNames(atoms, objects, object_type='channel', **kwargs):
     else:
         # Single object analysis in case someone provide objects[0]
         points, radii = _sampleObjectSpheres(objects)
-        residues = _liningResidues(atoms, tree, points, radii, options.distA)
+        residues = _liningResidues(atoms, source, points, radii, options.distA,
+                                   deep)
         residues_info = _formatLiningResidues(residues, options)
         selected_residues_ch = [", ".join(residues_info) if residues_info else "None"]
+
+    # Once for the whole report, not once per object: a cofactor lines several
+    # channels of the same protein and is one finding, not several.
+    _reportDeepLiningAtoms(atoms, deep)
 
     if options.residues_file_name is not None:
         output_file = '{0}_Residues_All_{1}.txt'.format(
@@ -4388,8 +4519,9 @@ def getObjectResidueNames(atoms, objects, object_type='channel', **kwargs):
 def getObjectResidueNamesMultipleFrames(atoms, objects_all, trajectory=None, object_type='channel', **kwargs):
     '''Provides the resnames and resid of residues that are forming the object(s) in
     multiple frames/models. 
-    Residues are extracted based on distA which is the distance between FIL atoms 
-    (object atoms) and protein residues.
+    Residues are extracted based on distA, the clearance between the surface of
+    the FIL atoms (object atoms) and the van der Waals surface of the residue's
+    own atoms.
     Results could be save as txt file by providing the `residues_file_name` parameter.
     
     :arg atoms: an Atomic object from which residues are selected 
@@ -4410,10 +4542,11 @@ def getObjectResidueNamesMultipleFrames(atoms, objects_all, trajectory=None, obj
     :type object_type: str
 
     :arg distA: Residues reaching within this distance of the object's surface
-        are reported. The local probe radius is added to it, so the reach past
-        the surface is the same in a wide part of the object as in a narrow one.
-        The distance runs to the atom centre, so a touching atom sits at about
-        one van der Waals radius. Default is 2.5 [Ang]
+        are reported. It is a clearance between surfaces: the local probe radius
+        and the atom's van der Waals radius are both taken off, so a touching
+        atom sits at 0 and the reach is the same in a wide part of the object as
+        in a narrow one, and the same at a hydrogen as at a potassium ion.
+        Default is 1.5 [Ang]
     :type distA: int, float
     
     :arg residues_file_name: The file with residues will be saved in a text 
@@ -4515,8 +4648,9 @@ def getObjectResidueNamesMultipleFrames(atoms, objects_all, trajectory=None, obj
 
 def getChannelResidueNames(atoms, channels, **kwargs):
     '''Provides the resnames and resid of residues that are forming the channel(s). 
-    Residues are extracted based on distA which is the distance between FIL atoms 
-    (channel atoms) and protein residues.
+    Residues are extracted based on distA, the clearance between the surface of
+    the FIL atoms (channel atoms) and the van der Waals surface of the residue's
+    own atoms.
     Results could be save as txt file by providing the `residues_file_name` parameter.
     
     :arg atoms: an Atomic object from which residues are selected 
@@ -4528,10 +4662,11 @@ def getChannelResidueNames(atoms, channels, **kwargs):
     :type channels: list
 
     :arg distA: Residues reaching within this distance of the object's surface
-        are reported. The local probe radius is added to it, so the reach past
-        the surface is the same in a wide part of the object as in a narrow one.
-        The distance runs to the atom centre, so a touching atom sits at about
-        one van der Waals radius. Default is 2.5 [Ang]
+        are reported. It is a clearance between surfaces: the local probe radius
+        and the atom's van der Waals radius are both taken off, so a touching
+        atom sits at 0 and the reach is the same in a wide part of the object as
+        in a narrow one, and the same at a hydrogen as at a potassium ion.
+        Default is 1.5 [Ang]
     :type distA: int, float
     
     :arg residues_file_name: The file with residues will be saved in a text 
@@ -4564,8 +4699,9 @@ def getChannelResidueNames(atoms, channels, **kwargs):
 
 def getPoreResidueNames(atoms, pores, **kwargs):
     '''Provides the resnames and resid of residues that are forming the pore(s). 
-    Residues are extracted based on distA which is the distance between FIL atoms 
-    (pore atoms) and protein residues.
+    Residues are extracted based on distA, the clearance between the surface of
+    the FIL atoms (pore atoms) and the van der Waals surface of the residue's own
+    atoms.
     Results could be save as txt file by providing the `residues_file_name` parameter.
     
     :arg atoms: an Atomic object from which residues are selected 
@@ -4577,10 +4713,11 @@ def getPoreResidueNames(atoms, pores, **kwargs):
     :type pores: list
 
     :arg distA: Residues reaching within this distance of the object's surface
-        are reported. The local probe radius is added to it, so the reach past
-        the surface is the same in a wide part of the object as in a narrow one.
-        The distance runs to the atom centre, so a touching atom sits at about
-        one van der Waals radius. Default is 2.5 [Ang]
+        are reported. It is a clearance between surfaces: the local probe radius
+        and the atom's van der Waals radius are both taken off, so a touching
+        atom sits at 0 and the reach is the same in a wide part of the object as
+        in a narrow one, and the same at a hydrogen as at a potassium ion.
+        Default is 1.5 [Ang]
     :type distA: int, float
     
     :arg residues_file_name: The file with residues will be saved in a text 
@@ -4614,8 +4751,9 @@ def getPoreResidueNames(atoms, pores, **kwargs):
 def getLinkResidueNames(atoms, links, **kwargs):
     '''Provides the resnames and resid of residues that are forming the chamber
     link(s) returned in ``details['links']`` by :func:`calcChannels`.
-    Residues are extracted based on distA which is the distance between FIL atoms
-    (link atoms) and protein residues. A link runs from one chamber into a
+    Residues are extracted based on distA, the clearance between the surface of
+    the FIL atoms (link atoms) and the van der Waals surface of the residue's own
+    atoms. A link runs from one chamber into a
     shallower one and is cut where it joins it, so the residues reported are
     those lining the neck between the two sites, not a whole route to the solvent.
     Results could be save as txt file by providing the `residues_file_name` parameter.
@@ -4628,10 +4766,11 @@ def getLinkResidueNames(atoms, links, **kwargs):
     :type links: list
 
     :arg distA: Residues reaching within this distance of the object's surface
-        are reported. The local probe radius is added to it, so the reach past
-        the surface is the same in a wide part of the object as in a narrow one.
-        The distance runs to the atom centre, so a touching atom sits at about
-        one van der Waals radius. Default is 2.5 [Ang]
+        are reported. It is a clearance between surfaces: the local probe radius
+        and the atom's van der Waals radius are both taken off, so a touching
+        atom sits at 0 and the reach is the same in a wide part of the object as
+        in a narrow one, and the same at a hydrogen as at a potassium ion.
+        Default is 1.5 [Ang]
     :type distA: int, float
 
     :arg residues_file_name: The file with residues will be saved in a text
@@ -4662,8 +4801,9 @@ def getLinkResidueNames(atoms, links, **kwargs):
 
 def getChannelResidueNamesMultipleFrames(atoms, channels, trajectory=None, **kwargs):
     '''Provides the resnames and resid of residues that are forming the channel(s). 
-    Residues are extracted based on distA which is the distance between FIL atoms 
-    (channel atoms) and protein residues.
+    Residues are extracted based on distA, the clearance between the surface of
+    the FIL atoms (channel atoms) and the van der Waals surface of the residue's
+    own atoms.
     Results could be save as txt file by providing the `residues_file_name` parameter.
     
     :arg atoms: an Atomic object from which residues are selected 
@@ -4675,10 +4815,11 @@ def getChannelResidueNamesMultipleFrames(atoms, channels, trajectory=None, **kwa
     :type channels: list
 
     :arg distA: Residues reaching within this distance of the object's surface
-        are reported. The local probe radius is added to it, so the reach past
-        the surface is the same in a wide part of the object as in a narrow one.
-        The distance runs to the atom centre, so a touching atom sits at about
-        one van der Waals radius. Default is 2.5 [Ang]
+        are reported. It is a clearance between surfaces: the local probe radius
+        and the atom's van der Waals radius are both taken off, so a touching
+        atom sits at 0 and the reach is the same in a wide part of the object as
+        in a narrow one, and the same at a hydrogen as at a potassium ion.
+        Default is 1.5 [Ang]
     :type distA: int, float
     
     :arg residues_file_name: The file with residues will be saved in a text 
@@ -4712,8 +4853,9 @@ def getChannelResidueNamesMultipleFrames(atoms, channels, trajectory=None, **kwa
 
 def getPoreResidueNamesMultipleFrames(atoms, pores, trajectory=None, **kwargs):
     '''Provides the resnames and resid of residues that are forming the pore(s). 
-    Residues are extracted based on distA which is the distance between FIL atoms 
-    (pore atoms) and protein residues.
+    Residues are extracted based on distA, the clearance between the surface of
+    the FIL atoms (pore atoms) and the van der Waals surface of the residue's own
+    atoms.
     Results could be save as txt file by providing the `residues_file_name` parameter.
     
     :arg atoms: an Atomic object from which residues are selected 
@@ -4725,10 +4867,11 @@ def getPoreResidueNamesMultipleFrames(atoms, pores, trajectory=None, **kwargs):
     :type pores: list
 
     :arg distA: Residues reaching within this distance of the object's surface
-        are reported. The local probe radius is added to it, so the reach past
-        the surface is the same in a wide part of the object as in a narrow one.
-        The distance runs to the atom centre, so a touching atom sits at about
-        one van der Waals radius. Default is 2.5 [Ang]
+        are reported. It is a clearance between surfaces: the local probe radius
+        and the atom's van der Waals radius are both taken off, so a touching
+        atom sits at 0 and the reach is the same in a wide part of the object as
+        in a narrow one, and the same at a hydrogen as at a potassium ion.
+        Default is 1.5 [Ang]
     :type distA: int, float
     
     :arg residues_file_name: The file with residues will be saved in a text 
@@ -4781,10 +4924,11 @@ def getLinkResidueNamesMultipleFrames(atoms, links, trajectory=None, **kwargs):
     :type trajectory: :class:`.Atomic`, :class:`.Ensemble`, or trajectory-like object
 
     :arg distA: Residues reaching within this distance of the object's surface
-        are reported. The local probe radius is added to it, so the reach past
-        the surface is the same in a wide part of the object as in a narrow one.
-        The distance runs to the atom centre, so a touching atom sits at about
-        one van der Waals radius. Default is 2.5 [Ang]
+        are reported. It is a clearance between surfaces: the local probe radius
+        and the atom's van der Waals radius are both taken off, so a touching
+        atom sits at 0 and the reach is the same in a wide part of the object as
+        in a narrow one, and the same at a hydrogen as at a potassium ion.
+        Default is 1.5 [Ang]
     :type distA: int, float
 
     :arg residues_file_name: The file with residues will be saved in a text
@@ -4817,8 +4961,8 @@ def getLinkResidueNamesMultipleFrames(atoms, links, trajectory=None, **kwargs):
 def getSurfaceCavityResidueNames(atoms, cavities, surface, **kwargs):
     '''Provides the resnames and resid of residues that form surface cavities.
 
-    Residues are extracted based on distA, which is the distance between surface
-    cavity points and protein residues. Surface cavity points are taken from
+    Residues are extracted based on distA, the clearance between the surface of
+    the cavity points and the van der Waals surface of the residue's own atoms. Surface cavity points are taken from
     Voronoi vertices assigned to each cavity. Results can be saved as a txt file 
     by providing the `residues_file_name` parameter.
 
@@ -4834,10 +4978,11 @@ def getSurfaceCavityResidueNames(atoms, cavities, surface, **kwargs):
     :type surface: list
 
     :arg distA: Residues reaching within this distance of the object's surface
-        are reported. The local probe radius is added to it, so the reach past
-        the surface is the same in a wide part of the object as in a narrow one.
-        The distance runs to the atom centre, so a touching atom sits at about
-        one van der Waals radius. Default is 2.5 [Ang]
+        are reported. It is a clearance between surfaces: the local probe radius
+        and the atom's van der Waals radius are both taken off, so a touching
+        atom sits at 0 and the reach is the same in a wide part of the object as
+        in a narrow one, and the same at a hydrogen as at a potassium ion.
+        Default is 1.5 [Ang]
     :type distA: int, float
 
     :arg residues_file_name: The file with residues will be saved in a text file
@@ -4879,9 +5024,10 @@ def getSurfaceCavityResidueNames(atoms, cavities, surface, **kwargs):
         cavities = [cavities]
 
     selected_residues_cav = []
-    tree = _kdTree(atoms)
+    source = _liningSource(atoms)
     radii_source = _vertexRadiiSource(atoms)
     intruding = 0
+    deep = {}
 
     for i, cavity in enumerate(cavities):
         if cavity.tetrahedra is None or len(cavity.tetrahedra) == 0:
@@ -4891,7 +5037,8 @@ def getSurfaceCavityResidueNames(atoms, cavities, surface, **kwargs):
         points = vertices[cavity.tetrahedra]
         radii = _vertexRadii(points, radii_source)
         intruding += int((radii < 0).sum())
-        residues = _liningResidues(atoms, tree, points, radii, options.distA)
+        residues = _liningResidues(atoms, source, points, radii, options.distA,
+                                   deep)
 
         residues_info = _formatLiningResidues(residues, options)
         residues_list = ", ".join(residues_info) if residues_info else "None"
@@ -4905,10 +5052,15 @@ def getSurfaceCavityResidueNames(atoms, cavities, surface, **kwargs):
               "one given here, so their lining is reported against the wrong "
               "structure.".format(intruding))
 
+    # Names them, where the count above only counts; the two read the same
+    # geometry from opposite ends, the vertex radius and the lining gap.
+    _reportDeepLiningAtoms(atoms, deep)
+
     if options.residues_file_name is not None:
         output_file = options.residues_file_name + '_Residues_All_surface_cavities.txt'
         with open(output_file, "w") as f_res:
-            f_res.write("# cavity_id residues_within_" + str(options.distA) + "_A\n")
+            f_res.write("# cavity_id residues_within_" + str(options.distA)
+                        + "_A_of_the_cavity_surface\n")
             for k in selected_residues_cav:
                 f_res.write("{0}_{1}\n".format(options.residues_file_name, k))
                 
@@ -4963,10 +5115,11 @@ def getSurfaceCavityResidueNamesMultipleFrames(atoms, cavities_all,
     :type residues_file_name: str
 
     :arg distA: Residues reaching within this distance of the cavity's surface
-        are reported. The inscribed radius at each cavity vertex is added to it,
-        so the reach past the surface is the same in a wide cavity as in a
-        narrow one. The distance runs to the atom centre, so a touching atom
-        sits at about one van der Waals radius. Default is 2.5 Å.
+        are reported. It is a clearance between surfaces: the inscribed radius at
+        each cavity vertex and the atom's van der Waals radius are both taken
+        off, so a touching atom sits at 0 and the reach is the same in a wide
+        cavity as in a narrow one, and the same at a hydrogen as at a potassium
+        ion. Default is 1.5 Å.
     :type distA: int, float
 
     :arg one_letter_aa: whether to apply one-letter code to residue names.
