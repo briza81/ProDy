@@ -129,6 +129,56 @@ _ZIMMERMAN_POLARITY = {
     'SER': 1.67, 'THR': 1.66, 'TRP': 2.10, 'TYR': 1.61, 'VAL': 0.13
 }
 
+# Relative mutability, from empirical substitution matrices; the scale's reference
+# is ALA at 100. Beware that Dayhoff's relative mutability is a different table
+# under the same name - it is the one ProtScale serves - and differs by up to 40
+# points, so a lookup by name alone lands on the wrong one. MOLE's own method page
+# quotes thirteen of these values, and all thirteen agree with the table here.
+# JTT - Jones, Taylor and Thornton - Bioinformatics 1992, 8, 275-282.
+_JTT_MUTABILITY = {
+    'ALA': 100, 'ARG': 83, 'ASN': 104, 'ASP': 86, 'CYS': 44,
+    'GLN': 84, 'GLU': 77, 'GLY': 50, 'HIS': 91, 'ILE': 103,
+    'LEU': 54, 'LYS': 72, 'MET': 93, 'PHE': 51, 'PRO': 58,
+    'SER': 117, 'THR': 107, 'TRP': 25, 'TYR': 50, 'VAL': 98
+}
+
+# Lipophilicity and solubility of the Cbeta side-chain fragments, predicted rather
+# than measured: MOLE obtained them from chemicalize.org and publishes them only as
+# prose in its method page, which is where these were read from. Glycine has no
+# side-chain fragment, so all three give it 0 rather than leaving it out.
+#
+# logP is the octanol/water partition coefficient of the fragment and logD the
+# distribution coefficient at pH 7.4, which differ only where the fragment ionises
+# - the two tables are equal for the fifteen neutral residues and lower in logD for
+# ASP, GLU, ARG, LYS and HIS. That relationship is worth keeping in mind if these
+# are ever re-typed, since it is the one internal check on them.
+_MOLE_LOGP = {
+    'ALA': 1.08, 'ARG': -0.08, 'ASN': -1.03, 'ASP': -0.22, 'CYS': 0.84,
+    'GLN': -0.33, 'GLU': 0.48, 'GLY': 0.00, 'HIS': -0.01, 'ILE': 2.24,
+    'LEU': 2.08, 'LYS': 0.70, 'MET': 1.48, 'PHE': 2.49, 'PRO': 1.80,
+    'SER': -0.52, 'THR': -0.16, 'TRP': 2.59, 'TYR': 2.18, 'VAL': 1.80
+}
+
+_MOLE_LOGD = {
+    'ALA': 1.08, 'ARG': -2.49, 'ASN': -1.03, 'ASP': -3.00, 'CYS': 0.84,
+    'GLN': -0.33, 'GLU': -2.12, 'GLY': 0.00, 'HIS': -0.11, 'ILE': 2.24,
+    'LEU': 2.08, 'LYS': -1.91, 'MET': 1.48, 'PHE': 2.49, 'PRO': 1.80,
+    'SER': -0.52, 'THR': -0.16, 'TRP': 2.59, 'TYR': 2.18, 'VAL': 1.80
+}
+
+# Water solubility at pH 7.4, as a unit-stripped base-10 logarithm of mol/litre.
+_MOLE_LOGS = {
+    'ALA': 0.59, 'ARG': 1.63, 'ASN': 0.54, 'ASP': 2.63, 'CYS': 0.16,
+    'GLN': 0.13, 'GLU': 2.23, 'GLY': 0.00, 'HIS': -0.20, 'ILE': -1.85,
+    'LEU': -1.79, 'LYS': 1.46, 'MET': -0.72, 'PHE': -1.81, 'PRO': -1.30,
+    'SER': 1.11, 'THR': 0.77, 'TRP': -2.48, 'TYR': -1.44, 'VAL': -1.30
+}
+
+# The residues every scale above covers - they share one set of twenty keys. What
+# lies outside it is what a lining report has to be honest about: a nucleotide, a
+# cofactor, a modified or differently protonated residue, an ion.
+_SCALE_RESIDUES = frozenset(_KYTE_DOOLITTLE)
+
 # Charge, as the schema itself defines it rather than by way of ProDy's acidic
 # and basic flags: the item description spells the formula out, so taking it
 # literally is what makes the number reproducible from the schema alone.
@@ -6806,35 +6856,53 @@ def _residueProperties(resnames):
     every residue, since a residue absent from a scale is genuinely uncharged rather
     than unmeasured.
 
-    ``mutability``, ``logD``, ``logP`` and ``logS`` are ``None`` throughout, for two
-    different reasons. The three lipophilicity scales MOLE obtains from a commercial
-    predictor and publishes no table for, so reproducing one by name alone would put
-    numbers in the file that do not match the values they claim to be. ``mutability``
-    is merely not done yet: MOLE names it as the relative mutability of Jones, Taylor
-    and Thornton (CABIOS 1992, 8, 275-282), which is as citable as the three scales
-    above and would drop in here beside them. Note when adding it that Dayhoff's
-    relative mutability is a different table under the same words - it is the one
-    ProtScale serves - so the anchors want checking against JTT's own paper."""
+    The averages are taken over lining residues, which is how MOLE defines every one
+    of these, and over side-chain values, since that is what the scales measure. MOLE
+    additionally gives a residue touching the route only through its backbone a
+    per-scale mainchain value rather than its own; that is not reproduced here, being
+    undocumented for four of the seven scales and inferable only by fitting. The
+    numbers are therefore MOLE's scales computed over this module's lining, and agree
+    with MOLEonline's to the extent the two linings agree - not bit for bit."""
 
     def mean(scale):
         values = [scale[name] for name in resnames if name in scale]
         return float(np.mean(values)) if values else None
 
-    charges = [_CHARGED_RESIDUES.get(name, 0) for name in resnames]
+    # Everything is computed over the standard residues alone - the ones the scales
+    # and the schema's own formulas are defined for - and never over a default
+    # substituted for the rest. Calling an unscored residue neutral would put a
+    # figure in the file that is untrue rather than merely partial: a route walled
+    # by nucleotides is not uncharged, whatever its charged amino acids sum to.
+    #
+    # What makes the numbers honest is therefore not their arithmetic but the
+    # fraction they cover, which the caller records and reports; see
+    # _reportUncoveredLining.
+    scored = [name for name in resnames if name in _SCALE_RESIDUES]
 
+    charges = [_CHARGED_RESIDUES.get(name, 0) for name in scored]
+
+    # A lining with nothing scorable in it yields no count either, not a zero.
+    # Summing an empty set gives 0 and averaging one is undefined, so left alone
+    # the two halves of this dict would describe the same empty set differently -
+    # `?` for the averages and a confident 0 for the counts. Zero charged amino
+    # acids is also the truthful reading of a wall made entirely of nucleotides,
+    # and the least useful one.
     return {
-        'charge': int(sum(charges)),
-        'numPositives': int(sum(1 for c in charges if c > 0)),
-        'numNegatives': int(sum(1 for c in charges if c < 0)),
+        'charge': int(sum(charges)) if scored else None,
+        'numPositives': (int(sum(1 for c in charges if c > 0))
+                         if scored else None),
+        'numNegatives': (int(sum(1 for c in charges if c < 0))
+                         if scored else None),
         'hydropathy': mean(_KYTE_DOOLITTLE),
         'hydrophobicity': mean(_CID_HYDROPHOBICITY),
         'polarity': mean(_ZIMMERMAN_POLARITY),
-        'ionizable': int(sum(1 for name in resnames
-                             if name in _IONIZABLE_RESIDUES)),
-        'mutability': None,
-        'logD': None,
-        'logP': None,
-        'logS': None,
+        'ionizable': (int(sum(1 for name in scored
+                              if name in _IONIZABLE_RESIDUES))
+                      if scored else None),
+        'mutability': mean(_JTT_MUTABILITY),
+        'logD': mean(_MOLE_LOGD),
+        'logP': mean(_MOLE_LOGP),
+        'logS': mean(_MOLE_LOGS),
     }
 
 
@@ -6904,6 +6972,8 @@ def _objectCifRows(object_id, obj, type_name, context, num_samples):
     everything derived from them are simply absent, which the schema permits and a
     guess would not."""
 
+    from collections import Counter
+
     atoms = context['atoms']
     rows = {'channel': [], 'profile': [], 'props': [], 'layer': [],
             'residue': [], 'layer_residue': [], 'weighted': []}
@@ -6930,8 +7000,20 @@ def _objectCifRows(object_id, obj, type_name, context, num_samples):
         'auto': context['auto'],
         # The item is typed int and described as a count of the structure's
         # cavities, yet it sits on a per-channel row, where only an index makes
-        # sense. Read as an index: `origin` is the start point labelling the void
-        # this object was traced from, which is the closest thing the trace has.
+        # sense. Read as an index, and filled with the search site (sp<n>) rather
+        # than with the index of the Delaunay cavity the site lies in.
+        #
+        # Deliberately, because the site is this module's operative void: chambers
+        # are carved at a probe radius of their own, and each seeded chamber is
+        # searched independently, so two chambers of one cavity are two separate
+        # sub-cavities here and their channels have no more in common than any
+        # other pair. The cavity index would group them; that grouping is the one
+        # the trace does not use.
+        #
+        # The consequence to know is that channels sharing a Delaunay cavity can
+        # carry different values - on 1tqn, sites sp0 and sp4 are both chambers of
+        # cavity 0. The log's site table gives the cavity for every site, and the
+        # schema has nowhere to record the chamber, its `cavity` being an int.
         'cavity': 0 if obj.origin is None else int(obj.origin),
     })
 
@@ -6992,8 +7074,15 @@ def _objectCifRows(object_id, obj, type_name, context, num_samples):
     layer_minima = [float(radii[first:last + 1].min())
                     for first, last, _ in layers]
 
+    # Kept beside the rows rather than read back out of them: the weighted props
+    # average logD, logP and logS over the layers, and sb_ncbr_channel_layer has no
+    # column for those three, so taking the weighting input from the written rows
+    # would silently weight nothing and write `?`.
+    layer_props = []
+
     for index, (first, last, residues) in enumerate(layers):
         props = _residueProperties([resname_of[r] for r in residues])
+        layer_props.append(props)
         order = index + 1
 
         local_minimum = (
@@ -7027,6 +7116,23 @@ def _objectCifRows(object_id, obj, type_name, context, num_samples):
             })
 
     lining = [resname_of[r] for r in ordered]
+
+    # Counted once per object, on the whole lining, rather than per layer, where
+    # the same residue would be tallied for every layer it touches.
+    #
+    # The schema defines every one of these items over amino acids - "a sum of
+    # charged amino acid residues", "amino acid polarities" - so a nucleotide, a
+    # cofactor or a modified residue has no value under it, and MOLE excludes them
+    # too. Nothing here departs from that. What is worth saying out loud is how much
+    # of the wall it leaves out, because the residues left out are rarely a random
+    # sample of it: a D-peptide loses its D-residues, a ribosomal route its
+    # nucleotides. Half of 1grm's lining goes this way.
+    missing = [name for name in lining if name not in _SCALE_RESIDUES]
+    if missing and lining:
+        context['uncovered'].update(missing)
+        context['coverage'][object_id] = (len(lining) - len(missing), len(lining),
+                                          Counter(missing))
+
     props = _residueProperties(lining)
     props['channel_id'] = object_id
     props['bRadius'] = _bRadius(atoms, context, layers, layer_minima, narrowest)
@@ -7038,7 +7144,7 @@ def _objectCifRows(object_id, obj, type_name, context, num_samples):
     for item in ('hydropathy', 'hydrophobicity', 'mutability', 'polarity',
                  'logD', 'logP', 'logS'):
         weighted[item] = _weightedMean(
-            [row.get(item) for row in rows['layer']], weights)
+            [props[item] for props in layer_props], weights)
     rows['weighted'].append(weighted)
 
     return rows
@@ -7146,16 +7252,23 @@ def writeChannelsCIF(filename, channels, atoms=None, structure=None, links=None,
     own words, since it fixes no vocabulary for them. ``type`` follows MOLE, a
     channel being a ``Tunnel``, a pore a ``Pore`` and a link a ``Path``. ``cavity``
     is typed as an int and described as a count, but sits on a per-channel row where
-    only an index makes sense, so the object's ``origin`` start point goes there.
-    ``method`` is ``CaviTracer`` and ``software`` is ProDy and its version.
+    only an index makes sense, so it carries the search site (``sp<n>``) the object
+    was traced from - the void this module actually works in, a chamber being carved
+    at its own probe radius and searched on its own. Channels in one Delaunay cavity
+    but different chambers therefore differ here; the log's site table maps every
+    site to its cavity. ``method`` is ``CaviTracer`` and ``software`` is ProDy and
+    its version.
 
-    Four items are always ``?``. The ``logD``, ``logP`` and ``logS`` lipophilicity
-    scales MOLE takes from a commercial predictor and publishes no table for;
-    ``mutability`` is simply not implemented yet, MOLE naming it as the relative
-    mutability of Jones, Taylor and Thornton. The three scales that are written -
-    hydropathy, hydrophobicity and polarity - are Kyte and Doolittle, Cid *et al.*
-    and Zimmerman *et al.* respectively, each identified by the extremes MOLE's
-    method page quotes.
+    Every physicochemical item is written, on the scales MOLE's method page names:
+    hydropathy from Kyte and Doolittle, hydrophobicity from Cid *et al.*, polarity
+    from Zimmerman *et al.*, mutability from Jones, Taylor and Thornton, and the
+    ``logP``, ``logD`` and ``logS`` fragment values MOLE publishes as prose. Only
+    ``bRadius`` can be absent, where the structure carries no B-factors.
+
+    They are those scales averaged over *this* module's lining, not a reproduction
+    of MOLEonline's numbers: the two disagree wherever the two linings do, and MOLE
+    also applies an undocumented per-scale mainchain value to backbone-only contacts
+    that is not imitated here.
 
     Unlike the PQR writers in this module, and like :func:`.writePDB` and
     :func:`.writePQR`, this takes the filename first, goes through
@@ -7205,10 +7318,12 @@ def writeChannelsCIF(filename, channels, atoms=None, structure=None, links=None,
         # the caller. Returns None rather than a name nothing is under.
         return None
 
+    notes = []
     if atoms is not None:
         # Once for the file, not once per object: a cofactor sitting in several
         # channels of one protein is one finding.
         _reportDeepLiningAtoms(atoms, context['deep'])
+        notes = _reportUncoveredLining(context)
 
     if structure is not None:
         from prody.proteins.ciffile import writeMMCIF
@@ -7219,7 +7334,7 @@ def writeChannelsCIF(filename, channels, atoms=None, structure=None, links=None,
         out.write('data_{0}\n'.format(context['block']))
 
     try:
-        _writeCifCategories(out, rows)
+        _writeCifCategories(out, rows, notes)
     finally:
         out.close()
 
@@ -7240,7 +7355,10 @@ def _cifContext(atoms, options, auto):
 
     from prody import __version__
 
+    from collections import Counter
+
     context = {'atoms': atoms, 'auto': bool(auto), 'deep': {},
+               'uncovered': Counter(), 'coverage': {},
                'distA': options.distA, 'block': 'channels',
                'software': 'ProDy {0}'.format(__version__),
                'lining': None, 'backbone': None, 'betas': None,
@@ -7292,7 +7410,63 @@ def _cifContext(atoms, options, auto):
     return context
 
 
-def _writeCifCategories(out, rows):
+def _objectSortKey(object_id):
+    """``('channel', 9)`` for ``channel9``, so ids sort numerically not lexically."""
+
+    import re
+
+    match = re.match(r'^(\D*)(\d+)$', object_id)
+    return (match.group(1), int(match.group(2))) if match else (object_id, -1)
+
+
+def _reportUncoveredLining(context):
+    """Say how much of each lining the physicochemical properties actually cover.
+
+    Returns the lines to write into the file as comments, having already logged the
+    same thing.
+
+    The properties are computed over standard residues alone, which is how the
+    schema defines them and what MOLE does. That is a true statement about those
+    residues and a misleading one about the channel, wherever the rest of the wall
+    is a nucleotide, a cofactor or a modified residue - and the rest is rarely a
+    random sample, a D-peptide losing its D-residues and a ribosomal route its
+    nucleotides. So the fraction covered travels with the numbers.
+
+    It goes in as a CIF comment because the schema has nowhere to put it: no
+    category carries a coverage or a het-residue field, and inventing an item would
+    make the file non-conformant. A comment is ignored by every parser and read by
+    every person, which is the right audience for a caveat. The residues themselves
+    are named in ``sb_ncbr_channel_residue`` regardless, so a reader can always
+    recompute this."""
+
+    coverage = context.get('coverage') or {}
+    if not coverage:
+        return []
+
+    def named(counts):
+        """``HEM`` for one, ``DLE(4), DVA(2)`` where a name recurs."""
+        return ', '.join(name if count == 1 else '{0}({1})'.format(name, count)
+                         for name, count in counts.most_common())
+
+    worst = min(scored / float(total) for scored, total, _ in coverage.values())
+
+    _warn("{0} channel(s) are lined in part by residues no scale covers, so their "
+          "properties describe only the standard residues - as little as {1:.0%} of "
+          "the lining. Not covered: {2}.".format(
+              len(coverage), worst, named(context['uncovered'])))
+
+    lines = ['# Physicochemical properties are computed over standard residues only,',
+             '# as the schema defines them. Where a lining holds anything else, the',
+             '# properties describe the standard part of it alone:']
+    # Numerically, so channel9 precedes channel11 as it does everywhere else.
+    for object_id in sorted(coverage, key=_objectSortKey):
+        scored, total, counts = coverage[object_id]
+        lines.append('#   {0}: {1} of {2} residues ({3:.0%}); not covered: {4}'.format(
+            object_id, scored, total, scored / float(total), named(counts)))
+    return lines
+
+
+def _writeCifCategories(out, rows, notes=()):
     """Write the audit block and every non-empty category, in schema order."""
 
     out.write('#\n')
@@ -7312,6 +7486,11 @@ def _writeCifCategories(out, rows):
              # T keys the category together with channel_id, and three decimals
              # collide on a route sampled at more than a thousand points.
              precision={'T': 5})
+
+    if notes:
+        out.write('#\n')
+        for line in notes:
+            out.write(line + '\n')
 
     _cifLoop(out, 'sb_ncbr_channel_props',
              ['channel_id', 'charge', 'hydropathy', 'hydrophobicity',
