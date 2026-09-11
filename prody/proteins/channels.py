@@ -3054,8 +3054,13 @@ def calcPoresFromChannels(channels, details, min_end_to_end=None, max_end_to_end
         # A directory takes pores.cif rather than channels.cif, for the same
         # reason the PQR path names them apart: a run writing both into one
         # folder would otherwise have the second overwrite the first.
-        writeChannelsCIF(_poreCifPath(output_path), pores, atoms,
-                         object_type='pore')
+        written = writeChannelsCIF(_poreCifPath(output_path), pores, atoms,
+                                   object_type='pore')
+        # As on the PQR path and in calcChannels: a viewer only for a run told a
+        # directory. The one script reads either format, so the hint names the
+        # file rather than a glob.
+        if written and Path(output_path).is_dir():
+            _writeVisScript(Path(written).parent, Path(written).name)
 
     elif output_path:
         output_path = Path(output_path)
@@ -10871,7 +10876,15 @@ def _writeVisScript(directory, pattern='chl*.pqr'):
     import os
 
     path = os.path.join(str(directory), 'vis_channels.py')
+    usage = '`pymol vis_channels.py -- <protein>.pdb "{0}"`'.format(pattern)
+
     if os.path.exists(path):
+        # Left as it is, but still announced. The hint is the useful half of this
+        # function, and a rerun into the same directory - the usual way to try a
+        # different setting - used to get a script and no word on how to use it,
+        # the one run that said so having scrolled away.
+        LOGGER.info('View the output with the PyMOL viewer already in {0}: '
+                    '{1}.'.format(os.path.dirname(path), usage))
         return
     try:
         with open(path, 'w') as script_file:
@@ -10881,5 +10894,4 @@ def _writeVisScript(directory, pattern='chl*.pqr'):
         _warn("Could not write the PyMOL viewer {0}: {1}".format(path, err))
     else:
         LOGGER.info('Wrote the PyMOL viewer {0}. View the output with '
-                    '`pymol vis_channels.py -- <protein>.pdb "{1}"`.'.format(
-                        path, pattern))
+                    '{1}.'.format(path, usage))
