@@ -4353,7 +4353,7 @@ class _FileChannel(object):
         self.origin = 0
 
 
-def _resolvePqrFiles(pqr_files):
+def _resolveChannelFiles(channel_files):
     """The convention :func:`calcChannelSurfaceOverlaps` already uses for this.
 
     ``False`` or ``None`` scans the working directory, a string names a folder,
@@ -4361,27 +4361,149 @@ def _resolvePqrFiles(pqr_files):
 
     import os
 
-    # A run told to write a .gz leaves .pqr.gz, so a scan that matched only .pqr
-    # would find nothing and report an empty folder rather than a compressed one.
-    suffixes = ('.pqr', '.pqr.gz')
+    # A run told to write a .gz leaves .pqr.gz or .cif.gz, so a scan that matched
+    # only the bare suffixes would find nothing and report a compressed folder as
+    # an empty one. Both formats are matched here, and which one a file actually
+    # holds is then decided by reading it.
+    suffixes = ('.pqr', '.pqr.gz', '.cif', '.cif.gz')
 
-    if pqr_files is False or pqr_files is None:
+    if channel_files is False or channel_files is None:
         return sorted(f for f in os.listdir('.') if f.endswith(suffixes))
-    if isinstance(pqr_files, str):
-        if os.path.isdir(pqr_files):
-            return sorted(os.path.join(pqr_files, f)
-                          for f in os.listdir(pqr_files)
+    if isinstance(channel_files, str):
+        if os.path.isdir(channel_files):
+            return sorted(os.path.join(channel_files, f)
+                          for f in os.listdir(channel_files)
                           if f.endswith(suffixes))
-        return [pqr_files]
-    if isinstance(pqr_files, (list, tuple)):
-        return [str(f) for f in pqr_files]
-    raise ValueError('pqr_files must be a list of files, a folder path, or '
-                     'nothing to read the .pqr files of the current folder; '
-                     'got {0!r}'.format(type(pqr_files).__name__))
+        return [channel_files]
+    if isinstance(channel_files, (list, tuple)):
+        return [str(f) for f in channel_files]
+    raise ValueError('channel_files must be a list of files, a folder path, or '
+                     'nothing to read the channel files of the current folder; '
+                     'got {0!r}'.format(type(channel_files).__name__))
 
 
-def _readChannelFiles(pqr_files):
-    """Channels of a written run, by frame, as :class:`_FileChannel` objects.
+def _channelFileFormat(path):
+    """``'mmcif'`` or ``'pqr'``, by what the file holds and not by its name.
+
+    What a run writes is decided by its ``output_format``, given or defaulted, and
+    the path only names the file. A multi-model run therefore writes mmCIF into a
+    name ending ``.pqr.gz`` if it is handed one, and a reader trusting the suffix
+    would find no FIL records and report an empty set. The first content line says
+    which it is plainly: an mmCIF opens a block, a PQR opens a record."""
+
+    with _channelFileOpen(path) as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#'):
+                continue
+            if stripped.startswith(('data_', 'loop_', '_')):
+                return 'mmcif'
+            if stripped.startswith(('REMARK', 'MODEL', 'ATOM', 'HETATM',
+                                    'CONECT', 'TER', 'END')):
+                return 'pqr'
+            raise ValueError(
+                '{0} is neither an mmCIF nor a PQR written by calcChannels: it '
+                'opens with {1!r}.'.format(path, stripped[:40]))
+    raise ValueError('{0} holds no content.'.format(path))
+
+
+def _readCifBlocks(handle, path, provenance):
+    """``(frame, records)`` for each ``data_`` block of a multi-model mmCIF.
+
+    Row by row, so that only the result is ever held: a block's rows become its
+    records as they arrive and nothing keeps the file. Only the categories that
+    carry what clustering reads are looked at - the geometry and the lining, and
+    the spheres, which a lean block holds as ``_prody_channel_sphere`` and a full
+    one as the schema's profile. The rest of a full block describes residues and
+    properties of a structure that is not here, and is skipped.
+
+    Channels are named ``0`` in a lean block and ``channel0`` in a full one, both
+    being the position the frame reported them in, so the index is read off the
+    digits either way."""
+
+    wanted = ('prody_channel', 'prody_channel_sphere', 'prody_channel_lining',
+              'sb_ncbr_channel_profile')
+
+    header, records = {}, {}
+    category, columns, in_loop, started = None, [], False, False
+
+    def _spheres(record, row):
+        record.setdefault('xyz', []).append(
+            (float(row['x']), float(row['y']), float(row['z'])))
+        record.setdefault('r', []).append(float(row['radius']))
+
+    def _record(name):
+        return records.setdefault(int(''.join(c for c in name if c.isdigit())),
+                                  {'lining': []})
+
+    def _finish():
+        # The frame is what the channels of two files are told apart by, and a
+        # file of a single structure carries none, so a block without it is
+        # refused rather than guessed at from the block name or the file name.
+        if 'frame' not in header:
+            raise ValueError(
+                '{0} holds a block with no _prody_channels.frame, so nothing '
+                'says which frame its channels belong to. Clustering compares '
+                'frames, and a single structure has none: write the ensemble '
+                "with calcChannelsMultipleFrames(multimodel=True, "
+                "output_format='mmcif').".format(path))
+        if header.get('topology'):
+            provenance.setdefault(header['topology'], header.get('title'))
+        return int(header['frame']), records
+
+    for line in handle:
+        if line.startswith('data_'):
+            if started:
+                yield _finish()
+            header, records = {}, {}
+            category, columns, in_loop, started = None, [], False, True
+        elif line.startswith('loop_'):
+            category, columns, in_loop = None, [], True
+        elif line.startswith('_'):
+            name, _, item = line.split()[0][1:].partition('.')
+            if in_loop:
+                category = name
+                columns.append(item)
+            elif name == 'prody_channels':
+                fields = line.split(None, 1)
+                if len(fields) > 1:
+                    header[item] = fields[1].strip().strip('\'"')
+        elif line.startswith('#') or not line.strip():
+            category, columns, in_loop = None, [], False
+        elif category in wanted:
+            fields = line.split()
+            if len(fields) != len(columns):
+                raise ValueError(
+                    '{0}: a _{1} row holds {2} values where the loop declares '
+                    '{3}. The file is truncated, or was reflowed by something '
+                    'that does not write mmCIF.'.format(
+                        path, category, len(fields), len(columns)))
+            row = dict(zip(columns, fields))
+            if category == 'prody_channel':
+                record = _record(row['id'])
+                for key, item in (('length', 'length'),
+                                  ('bottleneck', 'bottleneck'),
+                                  ('curvature', 'curvature'), ('cost', 'cost'),
+                                  ('pad', 'lining_pad'),
+                                  ('natoms', 'lining_natoms')):
+                    value = row.get(item)
+                    # '?' and '.' are mmCIF's unknown and inapplicable, and mean
+                    # here what a missing REMARK field means in a PQR.
+                    if value not in (None, '?', '.'):
+                        record[key] = value
+            elif category == 'prody_channel_sphere':
+                _spheres(_record(row['channel']), row)
+            elif category == 'prody_channel_lining':
+                _record(row['channel'])['lining'].append(int(row['atom']))
+            elif category == 'sb_ncbr_channel_profile':
+                _spheres(_record(row['channel_id']), row)
+
+    if started:
+        yield _finish()
+
+
+def _readPqrModels(handle, path, default_frame, provenance):
+    """``(frame, records)`` for each MODEL of a multi-model PQR.
 
     Read as text rather than through :func:`~.parsePQR`, for two reasons that both
     matter here: that parser ignores MODEL records for a PQR, so every frame would
@@ -4389,8 +4511,63 @@ def _readChannelFiles(pqr_files):
     and the geometry are. What it would give back - coordinates and radii with no
     way to tell one channel from the next - is the part that is cheapest to read.
 
-    The frame is the MODEL number, and where a file has none it is the trailing
-    number of the file name, which is how the per-frame writer names them.
+    The frame is the MODEL number, and a file with none keeps *default_frame*,
+    the trailing number of its name, which is how the per-frame writer named
+    them."""
+
+    frame, records = default_frame, {}
+
+    for line in handle:
+        if line.startswith('MODEL'):
+            yield frame, records
+            records = {}
+            frame = int(line[5:].strip() or 0)
+            continue
+        if line.startswith('REMARK'):
+            fields = line.split()
+            if len(fields) > 2 and fields[1] == 'topology':
+                if fields[2] == 'selection':
+                    continue
+                provenance.setdefault(
+                    fields[2],
+                    fields[fields.index('title') + 1] if 'title' in fields
+                    else None)
+                continue
+            if len(fields) > 2 and fields[1] == 'channel':
+                index = int(fields[2])
+                record = records.setdefault(index, {'lining': []})
+                for position, field in enumerate(fields[3:], start=3):
+                    if field.startswith('lining'):
+                        continue
+                    if '=' in field:
+                        key, _, value = field.partition('=')
+                        record[key] = value
+                    elif field.isdigit():
+                        record['lining'].append(int(field))
+                    elif field == 'from' and position + 1 < len(fields):
+                        # "from sp3": the search site, written only by a run
+                        # that had more than one to tell apart.
+                        record['origin'] = int(fields[position + 1][2:])
+            continue
+        if line.startswith('ATOM') and line[17:20] == 'FIL':
+            # Fixed columns: three %8.3f coordinates can run together
+            # without a space once one of them reaches -100.
+            index = int(line[22:26]) - 1
+            record = records.setdefault(index, {'lining': []})
+            record.setdefault('xyz', []).append(
+                (float(line[30:38]), float(line[38:46]), float(line[46:54])))
+            record.setdefault('r', []).append(float(line[60:66]))
+
+    yield frame, records
+
+
+def _readChannelFiles(channel_files):
+    """Channels of a written run, by frame, as :class:`_FileChannel` objects.
+
+    The files may be PQR or mmCIF, and the two may be mixed: each is identified by
+    what it holds rather than by what it is called, and each format's models or
+    blocks are turned into the same records, so that the checks below - the
+    duplicate frames, the lining count and the fingerprints - see one thing.
 
     Topology fingerprints are compared across the files rather than against a
     structure: what matters is that the frame ranges being clustered together came
@@ -4400,97 +4577,74 @@ def _readChannelFiles(pqr_files):
     import re
 
     frames, fingerprints, titles, seen = {}, {}, {}, {}
-    for path in _resolvePqrFiles(pqr_files):
+
+    def _flush(here, frame, path):
+        """Close off one model or block: its channels are numbered from 0 again."""
+        for index in sorted(here):
+            record = here[index]
+            if not record.get('xyz'):
+                continue
+            channel = _FileChannel(record['xyz'], record['r'], frame, index)
+            if record.get('natoms') is not None:
+                channel.lining = np.array(sorted(record['lining']), dtype=int)
+                channel.lining_pad = float(record.get('pad', 'nan'))
+                if len(channel.lining) != int(record['natoms']):
+                    raise ValueError(
+                        '{0}: channel {1} of frame {2} says it lists {3} '
+                        'lining atoms but {4} were read. The file is '
+                        'truncated or its lines were reflowed.'.format(
+                            path, index, frame, record['natoms'],
+                            len(channel.lining)))
+            for key, attribute in (('length', 'length'),
+                                   ('bottleneck', 'bottleneck'),
+                                   ('curvature', 'curvature'),
+                                   ('cost', 'cost')):
+                value = record.get(key)
+                if value not in (None, 'n/a'):
+                    setattr(channel, attribute, float(value))
+            if record.get('origin') is not None:
+                channel.origin = record['origin']
+            # A frame range collected twice - the per-chunk files beside the
+            # file they were merged into - would otherwise double every
+            # channel, and a duplicate of a route is its own nearest
+            # neighbour, so nothing downstream would look wrong. Two mmCIF
+            # chunks sharing a frame are caught here too, where a parser that
+            # held the whole document would have refused the repeated block
+            # name without saying which files repeat it.
+            if (frame, index) in seen:
+                raise ValueError(
+                    'channel {0} of frame {1} is {2}. The same frames are '
+                    'being read twice, so every one of them would be '
+                    'clustered against a copy of itself.'.format(
+                        index, frame,
+                        'in both {0} and {1}'.format(seen[(frame, index)], path)
+                        if seen[(frame, index)] != path
+                        else 'in {0} twice'.format(path)))
+            seen[(frame, index)] = path
+            frames.setdefault(frame, []).append(channel)
+
+    for path in _resolveChannelFiles(channel_files):
         if not os.path.isfile(path) or os.path.getsize(path) == 0:
             _warn("skipping empty or missing file {0}.".format(path))
             continue
 
-        tail = re.search(r'(\d+)\s*$', os.path.splitext(os.path.basename(path))[0])
-        frame = int(tail.group(1)) if tail else 0
-        here = {}
-
-        def _flush(here, frame):
-            """Close off one model: its channels are numbered from 0 again."""
-            for index in sorted(here):
-                record = here[index]
-                if not record.get('xyz'):
-                    continue
-                channel = _FileChannel(record['xyz'], record['r'], frame, index)
-                if record.get('natoms') is not None:
-                    channel.lining = np.array(sorted(record['lining']), dtype=int)
-                    channel.lining_pad = float(record.get('pad', 'nan'))
-                    if len(channel.lining) != int(record['natoms']):
-                        raise ValueError(
-                            '{0}: channel {1} of frame {2} says it lists {3} '
-                            'lining atoms but {4} were read. The file is '
-                            'truncated or its REMARK lines were reflowed.'.format(
-                                path, index, frame, record['natoms'],
-                                len(channel.lining)))
-                for key, attribute in (('length', 'length'),
-                                       ('bottleneck', 'bottleneck'),
-                                       ('curvature', 'curvature'),
-                                       ('cost', 'cost')):
-                    value = record.get(key)
-                    if value not in (None, 'n/a'):
-                        setattr(channel, attribute, float(value))
-                if record.get('origin') is not None:
-                    channel.origin = record['origin']
-                # A frame range collected twice - the per-chunk files beside the
-                # file they were merged into - would otherwise double every
-                # channel, and a duplicate of a route is its own nearest
-                # neighbour, so nothing downstream would look wrong.
-                if (frame, index) in seen:
-                    raise ValueError(
-                        'channel {0} of frame {1} is in both {2} and {3}. The '
-                        'same frames are being read twice, so every one of them '
-                        'would be clustered against a copy of itself.'.format(
-                            index, frame, seen[(frame, index)], path))
-                seen[(frame, index)] = path
-                frames.setdefault(frame, []).append(channel)
-
+        provenance = {}
         with _channelFileOpen(path) as handle:
-            for line in handle:
-                if line.startswith('MODEL'):
-                    _flush(here, frame)
-                    here = {}
-                    frame = int(line[5:].strip() or 0)
-                    continue
-                if line.startswith('REMARK'):
-                    fields = line.split()
-                    if len(fields) > 2 and fields[1] == 'topology':
-                        if fields[2] == 'selection':
-                            continue
-                        fingerprints.setdefault(fields[2], []).append(path)
-                        if 'title' in fields:
-                            titles[fields[2]] = fields[fields.index('title') + 1]
-                        continue
-                    if len(fields) > 2 and fields[1] == 'channel':
-                        index = int(fields[2])
-                        record = here.setdefault(index, {'lining': []})
-                        for position, field in enumerate(fields[3:], start=3):
-                            if field.startswith('lining'):
-                                continue
-                            if '=' in field:
-                                key, _, value = field.partition('=')
-                                record[key] = value
-                            elif field.isdigit():
-                                record['lining'].append(int(field))
-                            elif field == 'from' and position + 1 < len(fields):
-                                # "from sp3": the search site, written only by a
-                                # run that had more than one to tell apart.
-                                record['origin'] = int(fields[position + 1][2:])
-                    continue
-                if line.startswith('ATOM') and line[17:20] == 'FIL':
-                    # Fixed columns: three %8.3f coordinates can run together
-                    # without a space once one of them reaches -100.
-                    index = int(line[22:26]) - 1
-                    record = here.setdefault(index, {'lining': []})
-                    record.setdefault('xyz', []).append(
-                        (float(line[30:38]), float(line[38:46]),
-                         float(line[46:54])))
-                    record.setdefault('r', []).append(float(line[60:66]))
+            if _channelFileFormat(path) == 'mmcif':
+                blocks = _readCifBlocks(handle, path, provenance)
+            else:
+                tail = re.search(
+                    r'(\d+)\s*$', os.path.splitext(os.path.basename(path))[0])
+                blocks = _readPqrModels(handle, path,
+                                        int(tail.group(1)) if tail else 0,
+                                        provenance)
+            for frame, here in blocks:
+                _flush(here, frame, path)
 
-        _flush(here, frame)
+        for digest, title in provenance.items():
+            fingerprints.setdefault(digest, []).append(path)
+            if title:
+                titles[digest] = title
 
     if len(fingerprints) > 1:
         raise ValueError(
@@ -4503,8 +4657,9 @@ def _readChannelFiles(pqr_files):
 
     if not frames:
         raise ValueError('no channels were read. Files written by calcChannels '
-                         'hold their routes as FIL records; pqr_files={0!r} '
-                         'matched none.'.format(pqr_files))
+                         'hold their routes as FIL records in a PQR or as '
+                         'channel spheres in an mmCIF; channel_files={0!r} '
+                         'matched none.'.format(channel_files))
 
     return [frames[frame] for frame in sorted(frames)], sorted(frames)
 
@@ -4614,7 +4769,7 @@ def _reportClusterMemory(n, max_proc):
                   peak / 2.0 ** 30, available / 2.0 ** 30, max_proc))
 
 
-def calcChannelClusters(pqr_files=None, method='lining_atoms', cutoff=None,
+def calcChannelClusters(channel_files=None, method='lining_atoms', cutoff=None,
                         linkage_method=None, max_proc=2, mp_context=None,
                         return_details=False, **kwargs):
     """Group the channels of many frames into the routes they are frames of.
@@ -4628,13 +4783,14 @@ def calcChannelClusters(pqr_files=None, method='lining_atoms', cutoff=None,
     There is no single-frame counterpart and so no ``MultipleFrames`` suffix:
     clustering only means anything across frames.
 
-    :arg pqr_files: The channels to cluster, as written by
+    :arg channel_files: The channels to cluster, as written by
         :func:`calcChannelsMultipleFrames`: a list of paths, a folder, or None
-        for the ``.pqr`` files of the working directory. Frame ranges written by
-        separate jobs may be given together and are read as one set; they are
-        refused if they came from different structures, or if the same frames
-        appear twice.
-    :type pqr_files: list, str or None
+        for the channel files of the working directory. PQR and mmCIF are both
+        read, and may be mixed, each file being taken for what it holds rather
+        than for what it is called. Frame ranges written by separate jobs may be
+        given together and are read as one set; they are refused if they came
+        from different structures, or if the same frames appear twice.
+    :type channel_files: list, str or None
 
     :arg method: Which distance to cluster on. Default ``'lining_atoms'``.
 
@@ -4782,7 +4938,7 @@ def calcChannelClusters(pqr_files=None, method='lining_atoms', cutoff=None,
                             "and pass a cutoff." if 'percentile' in kwargs
                             else ''))
 
-    channels_all, frame_numbers = _readChannelFiles(pqr_files)
+    channels_all, frame_numbers = _readChannelFiles(channel_files)
     LOGGER.info("Read {0} channels from {1} frame{2}.".format(
         sum(len(f) for f in channels_all), len(frame_numbers),
         '' if len(frame_numbers) == 1 else 's'))
@@ -4883,7 +5039,7 @@ def calcChannelClusters(pqr_files=None, method='lining_atoms', cutoff=None,
                             'linkage_method': linkage_method, 'unit': unit,
                             'index': index, 'sizes': sizes,
                             'quantiles': quantiles,
-                            'files': _resolvePqrFiles(pqr_files),
+                            'files': _resolveChannelFiles(channel_files),
                             'frames': frame_numbers,
                             'channels': channels,
                             'shape': [len(f) for f in channels_all]}
