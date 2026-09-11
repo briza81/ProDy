@@ -619,6 +619,7 @@ def _writeMultiModelChannels(filename, frames, channels_all, atoms,
     shared file would need a lock and would still land in whatever order they
     finished; here the order is the order of the frames, for free."""
 
+    provenance = _frameProvenance(atoms, trajectory)
     header = [
         "REMARK   channels of %d frame%s, one MODEL each\n" % (
             len(frames), '' if len(frames) == 1 else 's'),
@@ -633,22 +634,13 @@ def _writeMultiModelChannels(filename, frames, channels_all, atoms,
         "REMARK   running between channels that never touched.\n",
         "REMARK\n",
         "REMARK   topology %s  atoms %d  title %s\n" % (
-            _topologyFingerprint(atoms), atoms.numAtoms(),
-            atoms.getTitle() or 'unnamed'),
+            provenance['topology'], provenance['natoms'], provenance['title']),
     ]
-    # A selection shifts every index, so it belongs beside the fingerprint it
-    # changes.
-    if hasattr(atoms, 'getSelstr'):
-        header.append("REMARK   topology selection %s\n" % atoms.getSelstr())
-    if trajectory is not None:
-        source = None
-        for getter in ('getFilename', 'getTitle'):
-            if hasattr(trajectory, getter):
-                source = getattr(trajectory, getter)()
-                if source:
-                    break
-        if source:
-            header.append("REMARK   frames from %s\n" % source)
+    if provenance['selection'] is not None:
+        header.append("REMARK   topology selection %s\n"
+                      % provenance['selection'])
+    if provenance['source']:
+        header.append("REMARK   frames from %s\n" % provenance['source'])
 
     with _channelFileOpen(filename, 'w') as out:
         out.writelines(header)
@@ -662,6 +654,126 @@ def _writeMultiModelChannels(filename, frames, channels_all, atoms,
                 out.writelines(lines)
                 atom_index += count
             out.write("ENDMDL\n")
+
+
+def _frameProvenance(atoms, trajectory=None):
+    """What a multi-model file records about where its channels came from.
+
+    Shared by the PQR header and the mmCIF frame blocks, so that the two formats
+    cannot come to describe one run differently. The fingerprint and the atom count
+    are what a reader holds the files of separate runs against; the title, the
+    selection and the source are there for the person reading the mismatch."""
+
+    source = None
+    if trajectory is not None:
+        for getter in ('getFilename', 'getTitle'):
+            if hasattr(trajectory, getter):
+                source = getattr(trajectory, getter)()
+                if source:
+                    break
+
+    return {'topology': _topologyFingerprint(atoms),
+            'natoms': atoms.numAtoms(),
+            'title': atoms.getTitle() or 'unnamed',
+            # A selection shifts every index, so it belongs beside the
+            # fingerprint it changes.
+            'selection': (atoms.getSelstr() if hasattr(atoms, 'getSelstr')
+                          else None),
+            'source': source or None}
+
+
+def _writeMultiModelChannelsCIF(filename, frames, channels_all, atoms,
+                                trajectory=None, bodies=None, num_samples=5):
+    """Every frame's channels in one mmCIF, a ``data_frame<n>`` block each.
+
+    The block is named for the frame and not for a counter, as the MODEL number is
+    in the PQR, so the files of two frame ranges concatenate into a valid whole,
+    and every block opens with ``_prody_channels``: the frame, whether the block
+    is lean or full, and where the channels came from.
+
+    Lean unless *bodies* is given. A lean block holds what ensemble processing
+    reads - each channel's geometry, its probe spheres and its lining atoms - under
+    ProDy's own categories, with no ``sb_ncbr`` category and no ``_audit_conform``,
+    since the layout is not the tunnels schema and should not claim to be. None of
+    it has to be measured against the structure, so it is formatted here straight
+    from the channel objects. *bodies* are full blocks instead, one text per frame,
+    built by the workers because that content is measured against each frame's own
+    coordinates.
+
+    A frame that found nothing still gets its block, which is the record that it
+    was computed."""
+
+    provenance = _frameProvenance(atoms, trajectory)
+    content = 'lean' if bodies is None else 'full'
+
+    with _channelFileOpen(filename, 'w') as out:
+        for position, (frame_nr, channels) in enumerate(zip(frames, channels_all)):
+            out.write('data_frame%d\n#\n' % frame_nr)
+            for item, value in (('frame', int(frame_nr)), ('content', content),
+                                ('topology', provenance['topology']),
+                                ('natoms', provenance['natoms']),
+                                ('title', provenance['title']),
+                                ('selection', provenance['selection']),
+                                ('source', provenance['source'])):
+                out.write('_prody_channels.%s %s\n' % (item, _cifValue(value)))
+            if bodies is None:
+                _writeLeanChannels(out, channels, num_samples)
+            else:
+                out.write(bodies[position])
+            out.write('#\n')
+
+
+def _writeLeanChannels(out, channels, num_samples=5, spheres=True, id_prefix=''):
+    """Geometry, probe spheres and lining atoms of one frame's *channels*.
+
+    ``_prody_channel`` carries what the PQR writes into each channel's REMARK,
+    ``_prody_channel_sphere`` the spheres the PQR writes as FIL atoms, and
+    ``_prody_channel_lining`` one row per lining atom. A full block already holds
+    the spheres as the schema's profile, so it passes ``spheres=False``, and names
+    its channels ``channel<n>`` as the schema categories do, through *id_prefix*.
+
+    The sphere and lining rows are formatted directly rather than through
+    :func:`_cifLoop`: they are most of an ensemble's file, all alike, and hold
+    nothing that needs quoting."""
+
+    if not channels:
+        return
+
+    geometry, sphere_rows, lining_rows = [], [], []
+    for index, channel in enumerate(channels):
+        name = '{0}{1}'.format(id_prefix, index)
+        lining = getattr(channel, 'lining', None)
+        pad = getattr(channel, 'lining_pad', None)
+        geometry.append({
+            'id': name,
+            'length': float(channel.length),
+            'bottleneck': float(channel.bottleneck),
+            'curvature': float(channel.curvature),
+            'cost': None if channel.cost is None else float(channel.cost),
+            'lining_pad': None if pad is None else float(pad),
+            'lining_natoms': None if lining is None else len(lining),
+        })
+        if spheres:
+            centers, radii = _sampleObjectSpheres(channel, num_samples)
+            sphere_rows.extend('%s %.3f %.3f %.3f %.3f\n' % (name, x, y, z, r)
+                               for (x, y, z), r in zip(centers, radii))
+        if lining is not None:
+            lining_rows.extend('%s %d\n' % (name, atom) for atom in lining)
+
+    _cifLoop(out, 'prody_channel',
+             ['id', 'length', 'bottleneck', 'curvature', 'cost', 'lining_pad',
+              'lining_natoms'], geometry, precision={'cost': 6, 'lining_pad': 2})
+
+    if sphere_rows:
+        out.write('#\nloop_\n')
+        for column in ('channel', 'x', 'y', 'z', 'radius'):
+            out.write('_prody_channel_sphere.%s\n' % column)
+        out.writelines(sphere_rows)
+
+    if lining_rows:
+        out.write('#\nloop_\n_prody_channel_lining.channel\n'
+                  '_prody_channel_lining.atom\n')
+        out.writelines(lining_rows)
 
 
 def _topologyOnly(atoms):
@@ -684,7 +796,7 @@ def _topologyOnly(atoms):
 def _calcChannelsMultipleFramesWorker(args):
     """Compute channels. Supporting function for muliprocessing in :func:`calcChannelsMultipleFrames`."""
     frame_nr, atoms, frame_coords, frame_output_path, separate, start_point, \
-        start_positions, drop_surface, return_details, kwargs = args
+        start_positions, drop_surface, cif_body, return_details, kwargs = args
 
     LOGGER.info("Frame/model: {0}".format(frame_nr))
     atoms_copy = atoms.copy()
@@ -702,6 +814,11 @@ def _calcChannelsMultipleFramesWorker(args):
                           separate=separate, start_point=start_point,
                           return_details=return_details, **kwargs)
 
+    # A full mmCIF block is measured against this frame's coordinates - the
+    # residues lining each channel and their properties - so it is built here,
+    # where those coordinates are, and travels back as text.
+    body = _multiModelCifBody(result[0], atoms_copy) if cif_body else None
+
     # The surface is the tessellation the channels were carved out of, and it is
     # some two hundred times their size - a third of a million tetrahedra against
     # a few dozen channels. It is what draws one structure's channels, which is
@@ -712,7 +829,7 @@ def _calcChannelsMultipleFramesWorker(args):
     # frame at once, the results all being collected before any can be discarded.
     if drop_surface:
         result = (result[0], None) + tuple(result[2:])
-    return result
+    return tuple(result) + (body,) if cif_body else result
 
 
 def _calcSurfaceCavitiesMultipleFramesWorker(args):
@@ -3606,7 +3723,28 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         from. Everything that reads channels back - :func:`calcChannelClusters`,
         the folder scan, the viewer left beside the file - takes ``.pqr.gz``
         wherever it takes ``.pqr``, so nothing has to be unpacked first.
+
+        The file is an mmCIF unless ``output_format='pqr'`` asks for the PQR
+        described above: one ``data_frame<n>`` block per frame, named for the frame
+        as the MODEL number is, and ``channels.cif.gz`` where only a directory was
+        given. What each block holds is set by ``lean``.
+
+        The format decides what is written and the path only names it. A file named
+        for the other format is still written under that name, with a word to say
+        so, rather than renamed to somewhere the caller never asked for.
     :type multimodel: bool
+
+    :arg lean: Only for ``multimodel=True`` with ``output_format='mmcif'``, and
+        refused anywhere else. True, the default there, writes what ensemble
+        processing reads - each channel's geometry, its probe spheres and its
+        lining atoms - under ProDy's own categories, with no ``sb_ncbr`` category
+        and no claim to conform to the tunnels schema, which that layout is not.
+        None of it is measured against the structure, so it is formatted from the
+        channels alone. False writes each frame's full tunnels-schema content
+        instead, measured against that frame: the lining residues, the layers and
+        the properties, which are also most of what such a file costs to compute
+        and to store.
+    :type lean: bool
 
     :arg start_point: Optional starting point for channel search, applied to every
         frame. If provided, the search is restricted to the cavity holding the
@@ -3694,6 +3832,7 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
     start_frame = kwargs.pop('start_frame', 0)
     stop_frame = kwargs.pop('stop_frame', -1)
     multimodel = kwargs.pop('multimodel', False)
+    lean = kwargs.pop('lean', None)
 
     # A file per object across an ensemble is frames times channels, which runs
     # into the tens of thousands for a trajectory of any length: unusable as a
@@ -3748,8 +3887,24 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
     # to name the per-frame files. The schema describes one structure and has no
     # frame of its own, so a frame per file is what keeps each written file
     # something the schema can describe - the same arrangement the PQR path uses.
-    frame_suffix = '.cif' if _isMmcifFormat(
-        kwargs.get('output_format', 'pqr'), separate) else '.pqr'
+    # A multi-model run writes an mmCIF unless it is told otherwise: it holds what
+    # ensemble processing reads in rather less room than the same frames as a PQR.
+    # The default is a format like any other - the caller passes one or takes this
+    # one - and the path names the file rather than choosing between them.
+    default_format = 'mmcif' if multimodel else 'pqr'
+
+    mmcif = _isMmcifFormat(kwargs.get('output_format', default_format), separate)
+    frame_suffix = '.cif' if mmcif else '.pqr'
+
+    # lean describes a multi-model mmCIF and nothing else: a PQR has one layout,
+    # and a single structure's mmCIF is the export case, whose schema content is
+    # the point of it. Refused rather than ignored, as an option that could not
+    # take effect would otherwise be found only by opening the file.
+    if lean is not None and not (multimodel and mmcif):
+        raise ValueError("lean applies only to multimodel=True with "
+                         "output_format='mmcif', where it chooses between the "
+                         "lean and the full content of each frame's block.")
+    full_cif = bool(multimodel and mmcif and lean is not None and not lean)
 
     if output_path:
         output_path = Path(output_path)
@@ -3757,19 +3912,30 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
             # One file, so the path names that file rather than a stem the
             # per-frame names are built from. Compressed when the caller named
             # only a directory and so expressed no preference: an ensemble's
-            # channels outgrow the trajectory they came from, and everything
-            # that reads them back takes .pqr.gz wherever it takes .pqr. A
-            # caller who names the file decides for themselves.
+            # channels outgrow the trajectory they came from, and the readers
+            # take the compressed file wherever they take the plain one.
+            suffix = '.cif' if mmcif else '.pqr'
             if output_path.is_dir():
-                output_path = output_path / "channels.pqr.gz"
+                output_path = output_path / ('channels' + suffix + '.gz')
             else:
                 # A trailing .gz asks for the file to be compressed and is kept;
                 # what has to name a channels file is the suffix beneath it.
                 name = str(output_path)
                 zipped = name.endswith('.gz')
                 plain = name[:-3] if zipped else name
-                if not plain.endswith(('.pqr', '.pdb')):
-                    plain = str(Path(plain).with_suffix('.pqr'))
+                if plain.endswith(('.pqr', '.pdb', '.cif')):
+                    # Written under the name given, even where that name says the
+                    # other format: renaming it would put the file somewhere the
+                    # caller never asked for, and it would not be where they went
+                    # looking. Said out loud instead, because otherwise the
+                    # mismatch surfaces in whatever opens the file next.
+                    if plain.endswith('.cif') != bool(mmcif):
+                        _warn('{0} is written as {1}, which its name does not '
+                              'say. The format decides what is written and the '
+                              'name was kept as given.'.format(
+                                  output_path, 'mmCIF' if mmcif else 'PQR'))
+                else:
+                    plain = str(Path(plain).with_suffix(suffix))
                 output_path = Path(plain + ('.gz' if zipped else ''))
         elif output_path.suffix in ('.pqr', '.cif'):
             output_path = output_path.with_suffix('')
@@ -3802,7 +3968,7 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
             
             tasks.append((j0, atoms_copy, np.array(frame0.getCoords(), copy=True),
                             frame_output_path, separate, start_point,
-                            start_positions, multimodel, return_details, kwargs))
+                            start_positions, multimodel, full_cif, return_details, kwargs))
         if nfi is not None:
             trajectory._nfi = nfi
 
@@ -3824,7 +3990,7 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
 
                 tasks.append((model_nr, atoms_copy, np.array(coordsets[model_nr], copy=True),
                                 frame_output_path, separate, start_point,
-                                start_positions, multimodel, return_details, kwargs))
+                                start_positions, multimodel, full_cif, return_details, kwargs))
                 
         else:
             LOGGER.info("Include trajectory or use multi-model PDB file.")
@@ -3853,7 +4019,11 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
         with ctx.Pool(processes=max_proc) as pool:
             results = pool.map(_calcChannelsMultipleFramesWorker, tasks)
 
+    bodies = []
     for result in results:
+        if full_cif:
+            bodies.append(result[-1])
+            result = result[:-1]
         if return_details:
             channels, surfaces, details = result
             details_all.append(details)
@@ -3870,8 +4040,14 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
     # run, and the frames concatenated from all of them would come up short.
     if multimodel and output_path:
         LOGGER.timeit('_prody_channels_multimodel')
-        _writeMultiModelChannels(output_path, [task[0] for task in tasks],
-                                 channels_all, atoms, trajectory)
+        frames = [task[0] for task in tasks]
+        if mmcif:
+            _writeMultiModelChannelsCIF(output_path, frames, channels_all, atoms,
+                                        trajectory,
+                                        bodies=bodies if full_cif else None)
+        else:
+            _writeMultiModelChannels(output_path, frames, channels_all, atoms,
+                                     trajectory)
         # The first frame's protein, so the routes can be looked at later by
         # someone holding nothing but this directory.
         reference = _writeReferenceStructure(
@@ -3883,13 +4059,17 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
             len(tasks), output_path), '_prody_channels_multimodel')
         LOGGER.info("Channels of {0} frames written to {1}.".format(
             len(tasks), output_path))
-        # Said here as well as in the file's own header, because the file is
-        # normally opened straight from the shell and the flag is not guessable
-        # from what a plain load shows: it draws, it just draws the wrong bonds.
-        LOGGER.info("    load it in PyMOL as `load {0}, discrete=1` - the "
-                    "models hold different numbers of atoms, and a plain load "
-                    "folds them together.".format(Path(output_path).name))
-        _writeFramesVisScript(Path(output_path).parent)
+        if not mmcif:
+            # Said here as well as in the file's own header, because the file is
+            # normally opened straight from the shell and the flag is not
+            # guessable from what a plain load shows: it draws, it just draws the
+            # wrong bonds.
+            LOGGER.info("    load it in PyMOL as `load {0}, discrete=1` - the "
+                        "models hold different numbers of atoms, and a plain "
+                        "load folds them together.".format(Path(output_path).name))
+            # vis_frames.py strides the MODEL blocks of a PQR, so beside an
+            # mmCIF it would have nothing it can read.
+            _writeFramesVisScript(Path(output_path).parent)
 
     if return_details:
         return channels_all, surfaces_all, details_all
@@ -9276,18 +9456,8 @@ def writeChannelsCIF(filename, channels, atoms=None, structure=None, links=None,
 
     path = _cifOutputPath(filename) if autoext else Path(filename)
 
-    context = _cifContext(atoms, options, auto)
-
-    rows = {'channel': [], 'profile': [], 'props': [], 'layer': [],
-            'residue': [], 'layer_residue': [], 'weighted': []}
-
-    for objects, kind in ((channels, object_type), (links, 'link')):
-        for index, obj in enumerate(objects):
-            produced = _objectCifRows(
-                '{0}{1}'.format(kind, index), obj, _CIF_OBJECT_TYPES[kind],
-                context, num_samples)
-            for category, values in produced.items():
-                rows[category].extend(values)
+    rows, notes, context = _cifRowsAndNotes(channels, links, atoms, options, auto,
+                                            object_type, num_samples)
 
     if not rows['channel']:
         # Nothing traced, so no file: a block holding only its own audit record
@@ -9295,13 +9465,6 @@ def writeChannelsCIF(filename, channels, atoms=None, structure=None, links=None,
         # a file whose channels failed to write. The count is already reported by
         # the caller. Returns None rather than a name nothing is under.
         return None
-
-    notes = []
-    if atoms is not None:
-        # Once for the file, not once per object: a cofactor sitting in several
-        # channels of one protein is one finding.
-        _reportDeepLiningAtoms(atoms, context['deep'])
-        notes = _reportUncoveredLining(context)
 
     if structure is not None:
         from prody.proteins.ciffile import writeMMCIF
@@ -9322,6 +9485,65 @@ def writeChannelsCIF(filename, channels, atoms=None, structure=None, links=None,
         ' (geometry only - no structure given to measure the lining against)'))
 
     return str(path)
+
+
+def _cifRowsAndNotes(channels, links, atoms, options, auto, object_type='channel',
+                     num_samples=5):
+    """``(rows, notes, context)``: the schema content of *channels* and *links*.
+
+    Split out of :func:`writeChannelsCIF` so that a frame of a multi-model run gets
+    exactly the content a single structure's file does, built by the worker that
+    holds that frame's coordinates. Nothing is reported, and *notes* stays empty,
+    when no channel was traced, as no file will be written about it."""
+
+    context = _cifContext(atoms, options, auto)
+
+    rows = {'channel': [], 'profile': [], 'props': [], 'layer': [],
+            'residue': [], 'layer_residue': [], 'weighted': []}
+
+    for objects, kind in ((channels, object_type), (links, 'link')):
+        for index, obj in enumerate(objects):
+            produced = _objectCifRows(
+                '{0}{1}'.format(kind, index), obj, _CIF_OBJECT_TYPES[kind],
+                context, num_samples)
+            for category, values in produced.items():
+                rows[category].extend(values)
+
+    notes = []
+    if rows['channel'] and atoms is not None:
+        # Once for the file, not once per object: a cofactor sitting in several
+        # channels of one protein is one finding.
+        _reportDeepLiningAtoms(atoms, context['deep'])
+        notes = _reportUncoveredLining(context)
+
+    return rows, notes, context
+
+
+def _multiModelCifBody(channels, atoms, num_samples=5):
+    """One frame's full mmCIF content as text, without its ``data_`` line.
+
+    The schema categories exactly as :func:`writeChannelsCIF` writes them for one
+    structure, measured against *atoms* at this frame's coordinates, followed by
+    the geometry and lining categories a lean block carries, which the schema has
+    no place for and which is what the channels are matched by across frames.
+    Empty when the frame found nothing, its block then holding only its header.
+
+    The start point a multi-model run requires means one site and no chamber
+    links, so there are only channels to write and none was chosen automatically."""
+
+    from io import StringIO
+
+    channels = list(channels)
+    rows, notes, _ = _cifRowsAndNotes(channels, [], atoms, _popLiningOptions({}),
+                                      auto=False, num_samples=num_samples)
+    if not rows['channel']:
+        return ''
+
+    buffer = StringIO()
+    _writeCifCategories(buffer, rows, notes)
+    _writeLeanChannels(buffer, channels, num_samples, spheres=False,
+                       id_prefix='channel')
+    return buffer.getvalue()
 
 
 def _cifContext(atoms, options, auto):
