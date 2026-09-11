@@ -6835,12 +6835,11 @@ def _backboneRadiiSource(atoms):
     it must be at least the radius, and mostly it is. It is not an invariant, though,
     and the exception is intrinsic rather than a sign of trouble: the spheres are read
     off the splines, not off the Voronoi vertices they were fitted to, so a sample
-    overshoots its inscribed sphere by a little and clips the wall. On 1tqn that puts
-    a quarter of the samples below their own radius by a median of 0.03 A and at most
-    0.08 A - the same overshoot the ``-0.5`` floor in :func:`_liningContacts` is set
-    well above. Nothing is clamped, because a clamp would hide the one case that does
-    mean something, a report measured against a structure other than the traced
-    one."""
+    overshoots its inscribed sphere by a little and clips the wall. The shortfall is a
+    few hundredths of an Angstrom - the same overshoot the ``-0.5`` floor in
+    :func:`_liningContacts` is set well above. Nothing is clamped, because a clamp
+    would hide the one case that does mean something, a report measured against a
+    structure other than the traced one."""
 
     backbone = atoms.select('backbone')
     if backbone is None or len(backbone) == 0:
@@ -7016,8 +7015,8 @@ def _objectCifRows(object_id, obj, type_name, context, num_samples):
         # the trace does not use.
         #
         # The consequence to know is that channels sharing a Delaunay cavity can
-        # carry different values - on 1tqn, sites sp0 and sp4 are both chambers of
-        # cavity 0. The log's site table gives the cavity for every site, and the
+        # carry different values, two chambers of one cavity being two sites. The
+        # log's site table gives the cavity for every site, and the
         # schema has nowhere to record the chamber, its `cavity` being an int.
         'cavity': 0 if obj.origin is None else int(obj.origin),
     })
@@ -7131,7 +7130,7 @@ def _objectCifRows(object_id, obj, type_name, context, num_samples):
     # too. Nothing here departs from that. What is worth saying out loud is how much
     # of the wall it leaves out, because the residues left out are rarely a random
     # sample of it: a D-peptide loses its D-residues, a ribosomal route its
-    # nucleotides. Half of 1grm's lining goes this way.
+    # nucleotides, and either can be half of a lining.
     missing = [name for name in lining if name not in _SCALE_RESIDUES]
     if missing and lining:
         context['uncovered'].update(missing)
@@ -10583,13 +10582,24 @@ CAVER_PRIMARIES = [(0.0, 0.0, 1.0),    # blue
 # the golden angle -- an irrational fraction of the circle, so it never returns
 # to a hue it has used and consecutive steps land as far apart as the circle
 # allows -- while saturation and value cycle on 3, so neighbours differ in more
-# than hue alone. The offset keeps the early generated hues clear of the six
-# primaries: without it rank 12 lands beside blue. It was chosen by maximising
-# the smallest CIE-Lab separation over 8..24 colours, where most cases sit,
-# which holds that separation near 15 where CAVER's own table dropped to 5.
+# than hue alone.
+#
+# The offset and the cycle are chosen for how the colours read on shaded
+# spheres, not as flat swatches. A sphere runs from lit to shadowed, so the
+# shadowed side of a bright colour can match the lit side of a dark one: two
+# colours count as distinct only if no version of one, dimmed to as little as
+# 0.55 of its light, matches such a version of the other. Distance is OKLab,
+# taken against the six primaries as well as among the generated colours, and
+# the worst pair is maximised across 8 to 24 channels, where most runs sit.
+#
+# Re-tune on those terms or not at all. Flat CIE-Lab rated the previous choice
+# near 15 where OKLab found 4.1, with rank 6 the same cyan as rank 3, and a
+# cycle tuned on flat OKLab alone collapsed its greens into one another once
+# shaded. Past a dozen channels no palette keeps every pair apart, so colour
+# stops identifying a channel there and the object names have to.
 GOLDEN_ANGLE = (3.0 - 5.0 ** 0.5) / 2.0
-HUE_OFFSET = 0.098
-SATURATION_VALUE = ((0.95, 1.00), (0.70, 1.00), (0.95, 0.72))
+HUE_OFFSET = 0.796
+SATURATION_VALUE = ((0.95, 0.55), (0.65, 0.65), (0.65, 0.95))
 
 def caverColour(rank):
     """Name of the colour for a 0-based channel rank, registered on first use.
