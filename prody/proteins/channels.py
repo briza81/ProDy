@@ -723,7 +723,8 @@ def _writeMultiModelChannelsCIF(filename, frames, channels_all, atoms,
             out.write('#\n')
 
 
-def _writeLeanChannels(out, channels, num_samples=5, spheres=True, id_prefix=''):
+def _writeLeanChannels(out, channels, num_samples=5, spheres=True, id_prefix='',
+                       ids=None):
     """Geometry, probe spheres and lining atoms of one frame's *channels*.
 
     ``_prody_channel`` carries what the PQR writes into each channel's REMARK,
@@ -731,6 +732,10 @@ def _writeLeanChannels(out, channels, num_samples=5, spheres=True, id_prefix='')
     ``_prody_channel_lining`` one row per lining atom. A full block already holds
     the spheres as the schema's profile, so it passes ``spheres=False``, and names
     its channels ``channel<n>`` as the schema categories do, through *id_prefix*.
+
+    Channels are named by their position unless *ids* names them, which a cluster
+    file does: its routes keep the numbers they had in the run they came from,
+    rather than being renumbered by where they happen to fall in the cluster.
 
     The sphere and lining rows are formatted directly rather than through
     :func:`_cifLoop`: they are most of an ensemble's file, all alike, and hold
@@ -741,7 +746,8 @@ def _writeLeanChannels(out, channels, num_samples=5, spheres=True, id_prefix='')
 
     geometry, sphere_rows, lining_rows = [], [], []
     for index, channel in enumerate(channels):
-        name = '{0}{1}'.format(id_prefix, index)
+        name = (str(ids[index]) if ids is not None
+                else '{0}{1}'.format(id_prefix, index))
         lining = getattr(channel, 'lining', None)
         pad = getattr(channel, 'lining_pad', None)
         geometry.append({
@@ -754,7 +760,10 @@ def _writeLeanChannels(out, channels, num_samples=5, spheres=True, id_prefix='')
             'lining_natoms': None if lining is None else len(lining),
         })
         if spheres:
-            centers, radii = _sampleObjectSpheres(channel, num_samples)
+            # Not _sampleObjectSpheres: a cluster file is written from channels
+            # read back off disk, which carry their samples rather than the
+            # splines those came from. _channelSamples takes either.
+            centers, radii = _channelSamples(channel, num_samples)
             sphere_rows.extend('%s %.3f %.3f %.3f %.3f\n' % (name, x, y, z, r)
                                for (x, y, z), r in zip(centers, radii))
         if lining is not None:
@@ -4447,7 +4456,7 @@ def _readCifBlocks(handle, path, provenance):
                 'frames, and a single structure has none: write the ensemble '
                 "with calcChannelsMultipleFrames(multimodel=True, "
                 "output_format='mmcif').".format(path))
-        if header.get('topology'):
+        if header.get('topology') not in (None, '', '?', '.'):
             provenance.setdefault(header['topology'], header.get('title'))
         return int(header['frame']), records
 
@@ -4561,7 +4570,7 @@ def _readPqrModels(handle, path, default_frame, provenance):
     yield frame, records
 
 
-def _readChannelFiles(channel_files):
+def _readChannelFiles(channel_files, provenance=None):
     """Channels of a written run, by frame, as :class:`_FileChannel` objects.
 
     The files may be PQR or mmCIF, and the two may be mixed: each is identified by
@@ -4571,7 +4580,12 @@ def _readChannelFiles(channel_files):
 
     Topology fingerprints are compared across the files rather than against a
     structure: what matters is that the frame ranges being clustered together came
-    from one structure, and the digest says that without anything else present."""
+    from one structure, and the digest says that without anything else present.
+
+    *provenance*, when a dict is passed for it, is filled with the structure they
+    all agreed on, so that what writes these channels out again can say where they
+    came from. Passed in rather than returned, the two values this gives back
+    being what every caller already unpacks."""
 
     import os
     import re
@@ -4628,20 +4642,20 @@ def _readChannelFiles(channel_files):
             _warn("skipping empty or missing file {0}.".format(path))
             continue
 
-        provenance = {}
+        found = {}
         with _channelFileOpen(path) as handle:
             if _channelFileFormat(path) == 'mmcif':
-                blocks = _readCifBlocks(handle, path, provenance)
+                blocks = _readCifBlocks(handle, path, found)
             else:
                 tail = re.search(
                     r'(\d+)\s*$', os.path.splitext(os.path.basename(path))[0])
                 blocks = _readPqrModels(handle, path,
                                         int(tail.group(1)) if tail else 0,
-                                        provenance)
+                                        found)
             for frame, here in blocks:
                 _flush(here, frame, path)
 
-        for digest, title in provenance.items():
+        for digest, title in found.items():
             fingerprints.setdefault(digest, []).append(path)
             if title:
                 titles[digest] = title
@@ -4660,6 +4674,12 @@ def _readChannelFiles(channel_files):
                          'hold their routes as FIL records in a PQR or as '
                          'channel spheres in an mmCIF; channel_files={0!r} '
                          'matched none.'.format(channel_files))
+
+    if provenance is not None and fingerprints:
+        # One digest by now, the disagreement having been refused above.
+        digest = sorted(fingerprints)[0]
+        provenance['topology'] = digest
+        provenance['title'] = titles.get(digest)
 
     return [frames[frame] for frame in sorted(frames)], sorted(frames)
 
@@ -4938,7 +4958,8 @@ def calcChannelClusters(channel_files=None, method='lining_atoms', cutoff=None,
                             "and pass a cutoff." if 'percentile' in kwargs
                             else ''))
 
-    channels_all, frame_numbers = _readChannelFiles(channel_files)
+    provenance = {}
+    channels_all, frame_numbers = _readChannelFiles(channel_files, provenance)
     LOGGER.info("Read {0} channels from {1} frame{2}.".format(
         sum(len(f) for f in channels_all), len(frame_numbers),
         '' if len(frame_numbers) == 1 else 's'))
@@ -5040,6 +5061,7 @@ def calcChannelClusters(channel_files=None, method='lining_atoms', cutoff=None,
                             'index': index, 'sizes': sizes,
                             'quantiles': quantiles,
                             'files': _resolveChannelFiles(channel_files),
+                            'provenance': provenance,
                             'frames': frame_numbers,
                             'channels': channels,
                             'shape': [len(f) for f in channels_all]}
@@ -5543,6 +5565,107 @@ def singletonColour():
 #: per-cluster files. Draws each channel as a line rather than a string of
 #: spheres: one channel is a couple of hundred spheres and a cluster of an
 #: ensemble holds thousands of channels, which is not a scene a viewer will turn.
+_VIS_CIF_LOOPS = r'''# --- Reading back a CIF this module wrote ---
+import shlex
+
+
+def cifBlocks(path):
+    """One {category: (columns, rows-as-token-lists)} per data_ block, in order.
+
+    Deliberately not a general CIF parser: this reads back files this module
+    wrote, whose loops are one row per line with no multi-line values. shlex
+    does the splitting so a quoted value ('ProDy 2.6.1') stays one token.
+
+    The blocks are kept apart because what a row names can depend on the block
+    it sits in: a cluster file names each route by the number it had in its own
+    frame, so the same name comes round once per block and means a different
+    route every time.
+
+    Shared by the viewers rather than copied into each, so that what is written
+    and what reads it back cannot drift apart.
+    """
+    blocks, loops = [], None
+    with open(path) as handle:
+        lines = handle.read().splitlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith("data_"):
+            loops = {}
+            blocks.append(loops)
+            i += 1
+            continue
+        if lines[i].strip() != "loop_":
+            i += 1
+            continue
+        if loops is None:
+            # A file whose loops start before any data_ line, which nothing here
+            # writes, but which should not be dropped on the floor.
+            loops = {}
+            blocks.append(loops)
+        i += 1
+        columns, category = [], None
+        while i < len(lines) and lines[i].startswith("_"):
+            category, _, column = lines[i].strip()[1:].partition(".")
+            columns.append(column)
+            i += 1
+        rows = []
+        while i < len(lines) and lines[i] and not lines[i][0] in "#_" \
+                and not lines[i].startswith(("loop_", "data_")):
+            try:
+                tokens = shlex.split(lines[i])
+            except ValueError:
+                tokens = lines[i].split()
+            if len(tokens) == len(columns):
+                rows.append(tokens)
+            i += 1
+        loops[category] = (columns, rows)
+    return blocks
+
+
+def cifLoops(path):
+    """category -> (columns, rows-as-token-lists), every block merged into one.
+
+    What the file holds without regard to which block held it, which for a file
+    of a single block is simply what the file holds.
+    """
+    merged = {}
+    for loops in cifBlocks(path):
+        for category, (columns, rows) in loops.items():
+            if category in merged and merged[category][0] == columns:
+                merged[category][1].extend(rows)
+            else:
+                merged[category] = (columns, list(rows))
+    return merged
+
+
+def cifItems(path):
+    """The plain `_category.item value` lines of a CIF, as {category: {item: value}}.
+
+    What a block says about itself rather than what it lists: a cluster file
+    records its number, how many channels fell into it and how many snapshots
+    they came from as items, not as a loop.
+    """
+    items = {}
+    in_loop = False
+    with open(path) as handle:
+        for line in handle:
+            stripped = line.strip()
+            if stripped.startswith("loop_"):
+                in_loop = True
+            elif not stripped or stripped.startswith(("#", "data_")):
+                in_loop = False
+            elif stripped.startswith("_") and not in_loop:
+                tag, _, value = stripped.partition(" ")
+                category, _, item = tag[1:].partition(".")
+                try:
+                    tokens = shlex.split(value)
+                except ValueError:
+                    tokens = value.split()
+                items.setdefault(category, {})[item] = tokens[0] if tokens else ""
+    return items
+'''
+
+
 _VIS_CLUSTERS_SCRIPT = r'''import glob
 import os
 import re
@@ -5566,16 +5689,21 @@ if protein_file is None:
     # The structure the clusters were found in, if it was written beside them.
     # Channels mean nothing without the protein they run through, and whoever
     # opens this later may not know which frame they belong to.
-    beside = sorted(glob.glob(os.path.join(here, '*.pdb'))
-                    + glob.glob(os.path.join(here, '*.cif')))
+    # The cluster files themselves are .cif when the run was written as mmCIF,
+    # and one of those loaded as the backdrop would be a handful of routes
+    # standing in for the protein.
+    beside = sorted(path for path in glob.glob(os.path.join(here, '*.pdb'))
+                    + glob.glob(os.path.join(here, '*.cif'))
+                    if not os.path.basename(path).startswith('cluster'))
     protein_file = beside[0] if beside else None
 
-files = sorted(glob.glob(os.path.join(here, "cluster*.pqr")),
+files = sorted(glob.glob(os.path.join(here, "cluster*.pqr"))
+               + glob.glob(os.path.join(here, "cluster*.cif")),
                key=lambda f: int(re.search(r"cluster(\d+)", f).group(1)))
 if not files:
-    print("No cluster*.pqr beside this script.")
+    print("No cluster*.pqr or cluster*.cif beside this script.")
 
-''' + _VIS_PALETTE + r'''
+''' + _VIS_PALETTE + _VIS_CIF_LOOPS + r'''
 if protein_file:
     protein_name = os.path.splitext(os.path.basename(protein_file))[0]
     cmd.load(protein_file, protein_name)
@@ -5586,11 +5714,107 @@ if protein_file:
     print(f"Loaded protein: {protein_name}")
 
 def snapshots(path):
-    """How many snapshots a cluster was seen in, from the REMARK its file opens
-    with; None for a file without one, which then keeps its rank colour."""
+    """How many snapshots a cluster was seen in: the mmCIF records it in the
+    header of every block, the PQR in the REMARK its file opens with. None where
+    neither says, and the cluster then keeps its rank colour."""
+    if path.endswith(".cif"):
+        value = cifItems(path).get("prody_channels", {}).get("cluster_snapshots")
+        return int(value) if value not in (None, "?", ".") else None
     with open(path) as handle:
         match = re.search(r"from (\d+) snapshot", handle.readline())
     return int(match.group(1)) if match else None
+
+# A PDB serial has five columns, so the CONECT records that make a cluster into
+# lines cannot name an atom past 99999. That is the limit the mmCIF cluster
+# files escape, and the escape is to hand PyMOL the routes in batches that each
+# stay under it, every batch numbering its own atoms from 1. The batches are
+# merged afterwards, so a cluster is still one object however large it is.
+SERIAL_LIMIT = 99999
+
+def loadCifCluster(path, name):
+    """Every route of an mmCIF cluster file, as one object of lines.
+
+    The file is the run's own format cut down to one cluster: a block per frame
+    the route was seen in. Routes are gathered a block at a time, since each is
+    named by the number it had in its own frame and that number comes round
+    again in the next - taken across the file, two frames that both hold a
+    channel 0 would be read as one route running between them.
+    """
+    routes = []
+    for loops in cifBlocks(path):
+        if "prody_channel_sphere" not in loops:
+            continue
+        columns, rows = loops["prody_channel_sphere"]
+        at = {column: position for position, column in enumerate(columns)}
+        if any(column not in at
+               for column in ("channel", "x", "y", "z", "radius")):
+            continue
+        here = {}
+        for row in rows:
+            here.setdefault(row[at["channel"]], []).append(
+                (float(row[at["x"]]), float(row[at["y"]]),
+                 float(row[at["z"]]), float(row[at["radius"]])))
+        routes.extend(here[channel] for channel in
+                      sorted(here, key=lambda name: int(
+                          re.search(r"(\d+)$", name).group(1))))
+
+    if not routes:
+        print(f"  {os.path.basename(path)}: no _prody_channel_sphere rows")
+        return False
+
+    batches, batch, held = [], [], 0
+    for spheres in routes:
+        if batch and held + len(spheres) > SERIAL_LIMIT:
+            batches.append(batch)
+            batch, held = [], 0
+        batch.append(spheres)
+        held += len(spheres)
+    if batch:
+        batches.append(batch)
+
+    # PyMOL bonds by distance as well as by CONECT unless it is told not to, and
+    # the routes of a cluster run within bonding distance of one another, so
+    # where two of them pass close the strands would be welded into a web. Its
+    # own PQR reader honours the CONECT records alone; this asks for the same.
+    previous = cmd.get("connect_mode")
+    cmd.set("connect_mode", 1)
+    parts = []
+    try:
+        for number, batch in enumerate(batches):
+            text, serial = [], 1
+            for slot, spheres in enumerate(batch):
+                first = serial
+                for x, y, z, radius in spheres:
+                    # The residue number tells one route of the cluster from the
+                    # next, as it does in the PQR cluster files.
+                    text.append("ATOM  %5d  H   FIL T%4d    "
+                                "%8.3f%8.3f%8.3f%6.2f%6.2f\n"
+                                % (serial, (slot + 1) % 10000, x, y, z, 1.00,
+                                   radius))
+                    serial += 1
+                text.extend("CONECT%5d%5d\n" % (bond, bond + 1)
+                            for bond in range(first, serial - 1))
+            part = name if len(batches) == 1 else "_%s_part%d" % (name, number)
+            cmd.read_pdbstr("".join(text), part)
+            parts.append(part)
+    finally:
+        cmd.set("connect_mode", previous)
+
+    if len(parts) > 1:
+        # By name pattern rather than an "or" of names, which would grow with
+        # every batch a long trajectory's cluster needs.
+        cmd.create(name, "_%s_part*" % name)
+        cmd.delete("_%s_part*" % name)
+    return True
+
+def loadCluster(path, name):
+    """One cluster into one object, whichever format it was written in."""
+    if path.endswith(".cif"):
+        return loadCifCluster(path, name)
+    # The bonds come from the CONECT records in the file, so each channel is one
+    # strand and no strand runs into the next.
+    cmd.load(path, name)
+    return True
 
 singletons = []
 for path in files:
@@ -5603,13 +5827,13 @@ for path in files:
     # so that one of them can still be picked out of the merged object.
     if snapshots(path) == 1:
         temporary = "_singleton%d" % rank
-        cmd.load(path, temporary)
+        if not loadCluster(path, temporary):
+            continue
         cmd.alter(temporary, "segi = %r" % str(rank))
         singletons.append(temporary)
         continue
-    cmd.load(path, name)
-    # The bonds come from the CONECT records in the file, so each channel is one
-    # strand and no strand runs into the next.
+    if not loadCluster(path, name):
+        continue
     cmd.hide("everything", name)
     cmd.show("lines", name)
     cmd.color(caverColour(rank), name)
@@ -5641,9 +5865,50 @@ print("Hide one with e.g. `disable cluster3`.")
 '''
 
 
+def _writeClusterCIF(path, row, members, channels, provenance=None,
+                     num_samples=5):
+    """One cluster as the run's own lean mmCIF, cut down to its members.
+
+    A cluster is channels gathered from many frames, which is what a multi-model
+    file already is, so a cluster file is written as one: a ``data_frame<n>``
+    block per frame the route was seen in, holding that frame's members under the
+    categories the run itself wrote. Nothing records which frame a member came
+    from, because the block it is in is that frame, and each channel keeps the
+    number it had in the run rather than being renumbered by where it fell in the
+    cluster. So anything that reads a run reads a cluster - the clustering
+    included, which can take a cluster file back and cut it again.
+
+    What makes it a cluster rather than a run is in each block's header: which
+    cluster it is, how many channels fell into it, how many of them were drawn,
+    and in how many snapshots it was seen."""
+
+    by_frame = {}
+    for member in members:
+        channel = channels[member]
+        by_frame.setdefault(channel.frame, []).append(channel)
+
+    header = dict(provenance or {})
+    with _channelFileOpen(path, 'w') as out:
+        for frame in sorted(by_frame):
+            here = sorted(by_frame[frame], key=lambda channel: channel.index)
+            out.write('data_frame%d\n#\n' % frame)
+            for item, value in (('frame', int(frame)), ('content', 'lean'),
+                                ('topology', header.get('topology')),
+                                ('title', header.get('title')),
+                                ('cluster', int(row['cluster'])),
+                                ('cluster_channels', int(row['channels'])),
+                                ('cluster_drawn', len(members)),
+                                ('cluster_snapshots', int(row['snapshots'])),
+                                ('cluster_frequency', float(row['frequency']))):
+                out.write('_prody_channels.%s %s\n' % (item, _cifValue(value)))
+            _writeLeanChannels(out, here, num_samples,
+                               ids=[channel.index for channel in here])
+            out.write('#\n')
+
+
 def saveChannelClusters(details, labels_all, output_path, min_channels=None,
                         top=None, max_per_cluster=5000, protein=None,
-                        one_per_snapshot=True, **kwargs):
+                        one_per_snapshot=True, output_format=None, **kwargs):
     """One file per cluster, drawn as lines, with a PyMOL viewer beside them.
 
     The clusters are the thing worth looking at, and there is no way to look at
@@ -5678,12 +5943,15 @@ def saveChannelClusters(details, labels_all, output_path, min_channels=None,
         share. A cluster of a long trajectory holds thousands of near-identical
         routes and the rest add nothing to see.
 
-        A cluster file is PQR, whose atom serials have five columns: past 99,999
+        A PQR cluster file has five columns for its atom serials: past 99,999
         atoms - a few hundred channels of a few hundred spheres each - they repeat,
         PyMOL drops the CONECT records that name them, and the channels beyond are
         loaded but not drawn, the viewer showing lines. Nothing is reported when
-        that happens, so where every channel of a large cluster has to be seen,
-        keep this low enough for its file to stay under that count.
+        that happens, so where every channel of a large PQR cluster has to be seen,
+        keep this low enough for its file to stay under that count. An mmCIF
+        cluster has no such ceiling: its viewer hands PyMOL the routes in batches
+        that each stay under the wrap, so the cap is only about how much there is
+        to look at.
     :type max_per_cluster: int
 
     :arg one_per_snapshot: Draw one channel per cluster per snapshot, the one of
@@ -5692,6 +5960,15 @@ def saveChannelClusters(details, labels_all, output_path, min_channels=None,
         draw every channel, which shows the spread of a route within a frame as
         well as across frames.
     :type one_per_snapshot: bool
+
+    :arg output_format: ``'pqr'`` or ``'mmcif'``. The default follows what the
+        channels were read from, so a run written as mmCIF leaves mmCIF clusters
+        beside it and a PQR run leaves PQR; a set of files mixing the two keeps
+        PQR. An mmCIF cluster is the run's own format restricted to one cluster -
+        a block per frame, each route under the number it had in the run - so the
+        clustering can read its own output back, which a PQR cluster file, whose
+        residue numbers hold only a slot within the file, cannot offer.
+    :type output_format: str or None
 
     :arg protein: The structure the channels were found in, written beside them
         so the viewer opens with something to show them against. A route means
@@ -5726,6 +6003,20 @@ def saveChannelClusters(details, labels_all, output_path, min_channels=None,
     if not os.path.isdir(output_path):
         os.makedirs(output_path)
 
+    if output_format is None:
+        # What the channels were read from, so the clusters of a run are written
+        # in the format the run was. A set that mixes the two keeps PQR, which
+        # every viewer here has always opened, rather than guessing at a majority.
+        formats = set()
+        for source in details.get('files') or []:
+            try:
+                formats.add(_channelFileFormat(source))
+            except (ValueError, OSError):
+                formats.add('pqr')
+        mmcif = formats == {'mmcif'}
+    else:
+        mmcif = _isMmcifFormat(output_format)
+
     channels = details['channels']
     written, drawn, capped = [], 0, 0
 
@@ -5737,6 +6028,15 @@ def saveChannelClusters(details, labels_all, output_path, min_channels=None,
             widths[~np.isfinite(widths)] = -np.inf
             members = np.sort(members[np.argsort(-widths)[:max_per_cluster]])
             capped += 1
+
+        if mmcif:
+            path = os.path.join(output_path,
+                                'cluster{0}.cif'.format(row['cluster']))
+            _writeClusterCIF(path, row, members, channels,
+                             details.get('provenance'))
+            written.append(path)
+            drawn += len(members)
+            continue
 
         path = os.path.join(output_path, 'cluster{0}.pqr'.format(row['cluster']))
         serial = 1
@@ -13009,7 +13309,6 @@ class ChannelCalculator:
 _VIS_CHANNELS_SCRIPT = r'''import glob
 import os
 import re
-import shlex
 import sys
 
 # --- Parse command-line args ---
@@ -13068,41 +13367,7 @@ print(f"Using channel regex: {channel_regex}")
 if cif_file:
     print(f"Using mmCIF: {cif_file}")
 
-''' + _VIS_PALETTE + r'''
-def cifLoops(path):
-    """category -> (columns, rows-as-token-lists). Enough CIF for what we write.
-
-    Deliberately not a general CIF parser: this reads back files this module
-    wrote, whose loops are one row per line with no multi-line values. shlex
-    does the splitting so a quoted value ('ProDy 2.6.1') stays one token.
-    """
-    loops = {}
-    with open(path) as handle:
-        lines = handle.read().splitlines()
-    i = 0
-    while i < len(lines):
-        if lines[i].strip() != "loop_":
-            i += 1
-            continue
-        i += 1
-        columns, category = [], None
-        while i < len(lines) and lines[i].startswith("_"):
-            category, _, column = lines[i].strip()[1:].partition(".")
-            columns.append(column)
-            i += 1
-        rows = []
-        while i < len(lines) and lines[i] and not lines[i][0] in "#_" \
-                and not lines[i].startswith(("loop_", "data_")):
-            try:
-                tokens = shlex.split(lines[i])
-            except ValueError:
-                tokens = lines[i].split()
-            if len(tokens) == len(columns):
-                rows.append(tokens)
-            i += 1
-        loops[category] = (columns, rows)
-    return loops
-
+''' + _VIS_PALETTE + _VIS_CIF_LOOPS + r'''
 # The protein: a file named on the command line, or the _atom_site the mmCIF
 # carries when it was written with one. Loading the .cif for its structure is
 # safe either way -- PyMOL simply finds no atoms when there is none -- but an
