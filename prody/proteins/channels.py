@@ -4076,9 +4076,11 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
             LOGGER.info("    load it in PyMOL as `load {0}, discrete=1` - the "
                         "models hold different numbers of atoms, and a plain "
                         "load folds them together.".format(Path(output_path).name))
-            # vis_frames.py strides the MODEL blocks of a PQR, so beside an
-            # mmCIF it would have nothing it can read.
-            _writeFramesVisScript(Path(output_path).parent)
+        # vis_frames.py reads either format - the MODEL blocks of a PQR, or the
+        # frame blocks of an mmCIF, which it turns into the same records - and an
+        # mmCIF run has more need of it, there being no plain load that shows it
+        # at all.
+        _writeFramesVisScript(Path(output_path).parent)
 
     if return_details:
         return channels_all, surfaces_all, details_all
@@ -13324,6 +13326,9 @@ import sys
 protein_file = None
 cif_file = None
 channel_regex = None
+# A channels file that was found and deliberately turned away, which is not the
+# same as having found none, and must not be reported as though it were.
+refused = None
 
 def holdsChannels(path):
     """Whether an mmCIF carries channels rather than only a structure.
@@ -13331,9 +13336,15 @@ def holdsChannels(path):
     An mmCIF is either one: the channels this module wrote, or a protein given
     as the backdrop. Told apart by content, since the extension says nothing,
     and a protein taken for the channels file would draw no channels at all.
+
+    Both layouts count. A file of one structure carries the schema's categories;
+    a multi-frame run carries ProDy's own. The second is not drawn here, but it
+    has to be recognised to be turned away, or it would be passed over as though
+    it held no channels.
     """
     with open(path) as handle:
-        return "_sb_ncbr_channel" in handle.read()
+        text = handle.read()
+    return "_sb_ncbr_channel" in text or "_prody_channel" in text
 
 for arg in sys.argv[1:]:
     # Only a structure counts as the protein, and PyMOL's own arguments are not
@@ -13362,6 +13373,32 @@ if cif_file is None and not glob.glob(channel_regex):
     found = sorted(f for f in glob.glob("*.cif") if holdsChannels(f))
     if found:
         cif_file = found[0]
+
+def frameBlocks(path):
+    """How many data_ blocks an mmCIF holds, counting no further than two."""
+    count = 0
+    with open(path) as handle:
+        for line in handle:
+            if line.startswith("data_"):
+                count += 1
+                if count > 1:
+                    break
+    return count
+
+if cif_file and frameBlocks(cif_file) > 1:
+    # A run of many frames. Drawn here its blocks would be laid one on top of
+    # another - every frame's channel 0 gathered into a single object, drawn as
+    # one route wandering between the frames - and nothing in the picture would
+    # say so. vis_frames.py strides the frames and loads them as states.
+    print(f"{cif_file} holds the channels of several frames, which this script "
+          f"would draw on top of one another. Nothing drawn from it. Open it "
+          f"with `pymol vis_frames.py -- {os.path.basename(cif_file)}`, which "
+          f"strides the frames and loads them as states.")
+    # Set aside rather than exited on: raising out of a script leaves PyMOL
+    # printing a traceback over the explanation, and closing the session would
+    # take an interactive window down over what is only the wrong file for this
+    # script. Anything else named still gets drawn.
+    refused, cif_file = cif_file, None
 
 print(f"Using channel regex: {channel_regex}")
 if cif_file:
@@ -13549,6 +13586,11 @@ if cif_file:
     cmd.zoom()
     print(f"Success: {sum(len(o) for o in cif_groups.values())} object(s) "
           f"loaded from {cif_file}.")
+elif refused:
+    # The only channels here were the ones turned away above, and that has been
+    # explained already. Reporting none found would contradict it, and send the
+    # reader to look for a file that is sitting in front of them.
+    pass
 elif not any(files for _, files, _ in sets):
     print("Error: No channel files found. Check your working directory (pwd).")
 else:
@@ -13589,19 +13631,22 @@ else:
 #: beside the multi-model PQR it writes. Separate from the per-channel viewer
 #: because the file is one object of many states rather than many files, and
 #: because it has to be loaded discretely and is usually too large to load whole.
-_VIS_FRAMES_SCRIPT = r'''"""View the channels of a multi-frame run, one MODEL per frame.
+_VIS_FRAMES_SCRIPT = r'''"""View the channels of a multi-frame run, one frame per state.
 
     pymol vis_frames.py
 
-That is the whole invocation: the .pqr and the .pdb are found beside the script.
-To name them, or to change the stride, a `--` is required --
+That is the whole invocation: the channels file and the .pdb are found beside the
+script. To name them, or to change the stride, a `--` is required --
 
-    pymol vis_frames.py -- <channels>.pqr [<protein>.pdb] [stride]
+    pymol vis_frames.py -- <channels>.pqr|.cif [<protein>.pdb] [stride]
 
 -- because PyMOL loads any file named on its own command line. Without the `--`
-it loads the .pqr a second time, plainly, on top of what this script loaded, and
-that plain copy is exactly what the striding and the discrete load are here to
-avoid. `stride` keeps every nth frame (default 10).
+it loads the channels file a second time, plainly, on top of what this script
+loaded, and that plain copy is exactly what the striding and the discrete load
+are here to avoid. `stride` keeps every nth frame (default 10).
+
+Either format is read: the MODEL blocks of a multi-model PQR, or the frame blocks
+of a multi-model mmCIF, which become the same records on the way in.
 
 The load is discrete. One frame finds more channels than another, so the models
 hold different numbers of atoms, and PyMOL's plain load folds them into a single
@@ -13661,22 +13706,20 @@ def find(*suffixes):
     return os.path.join(here, beside[0]) if beside else None
 
 
-channels = find('.pqr', '.pqr.gz')
+channels = find('.pqr', '.pqr.gz', '.cif', '.cif.gz')
 protein = find('.pdb')
 stride = next((int(a) for a in args if a.isdigit()), 10)
 
 if channels is None:
-    print('No .pqr found. Name one: pymol vis_frames.py -- channels.pqr')
+    print('No .pqr or .cif found. Name one: '
+          'pymol vis_frames.py -- channels.cif.gz')
     sys.exit(1)
 
 # Strided into a temporary file rather than loaded and thinned afterwards: the
 # cost this avoids is the reading and the holding, both of which happen at load.
-kept = 0
-handle = tempfile.NamedTemporaryFile('w', suffix='.pqr', delete=False)
-# The strided copy is written plain whatever the source is: it is read once,
-# straight away, by a PyMOL that would otherwise have to decompress it again.
-opener = gzip.open if channels.endswith('.gz') else open
-with opener(channels, 'rt') as source:
+def stridePqr(source, out, stride):
+    """The kept MODELs of a multi-model PQR, carried across as they stand."""
+    kept = 0
     # True until the first MODEL, so the file's own header is carried over, then
     # only for the frames kept. A channel's REMARK belongs to the model it sits
     # in and goes with it: carried across regardless, a skipped frame leaves its
@@ -13687,7 +13730,94 @@ with opener(channels, 'rt') as source:
             writing = (int(line[5:].strip() or 0) % stride == 0)
             kept += writing
         if writing:
-            handle.write(line)
+            out.write(line)
+    return kept
+
+
+def strideCif(source, out, stride):
+    """The kept frames of a multi-model mmCIF, written out as MODEL blocks.
+
+    Read a block at a time rather than parsed whole, for the reason the striding
+    itself exists: the file is what would not be held. Only the frames kept are
+    ever built into records, and a frame that is skipped costs no more than the
+    lines it takes to pass it by.
+
+    A frame's spheres become FIL atoms with a CONECT apiece, and the residue
+    number carries each channel's own index, so the colouring further down reads
+    a converted frame exactly as it reads a PQR's model. Serials start again in
+    every model, which keeps them clear of the five columns a PDB serial has
+    however many routes a frame holds.
+    """
+    kept = 0
+    frame = None
+    writing = False
+    category, columns, in_loop = None, [], False
+    routes, order = {}, []
+
+    def flush():
+        if not writing or not order:
+            return 0
+        out.write('MODEL     %4d\n' % frame)
+        serial = 1
+        for channel in order:
+            first = serial
+            for x, y, z, radius in routes[channel]:
+                out.write('ATOM  %5d  H   FIL T%4d    '
+                          '%8.3f%8.3f%8.3f%6.2f%6.2f\n'
+                          % (serial, (channel + 1) % 10000, x, y, z, 1.00,
+                             radius))
+                serial += 1
+            for bond in range(first, serial - 1):
+                out.write('CONECT%5d%5d\n' % (bond, bond + 1))
+        out.write('ENDMDL\n')
+        return 1
+
+    for line in source:
+        if line.startswith('data_'):
+            kept += flush()
+            frame, writing = None, False
+            category, columns, in_loop = None, [], False
+            routes, order = {}, []
+        elif line.startswith('loop_'):
+            category, columns, in_loop = None, [], True
+        elif line.startswith('_'):
+            name, _, item = line.split()[0][1:].partition('.')
+            if in_loop:
+                category = name
+                columns.append(item)
+            elif name == 'prody_channels' and item == 'frame':
+                frame = int(line.split()[1])
+                writing = (frame % stride == 0)
+        elif line.startswith('#') or not line.strip():
+            category, columns, in_loop = None, [], False
+        elif writing and category in ('prody_channel_sphere',
+                                      'sb_ncbr_channel_profile'):
+            # A lean block holds the spheres itself; a full one holds them as
+            # the schema's profile, under a differently named id.
+            fields = line.split()
+            if len(fields) != len(columns):
+                continue
+            row = dict(zip(columns, fields))
+            named = row.get('channel', row.get('channel_id', '0'))
+            channel = int(re.search(r'(\d+)$', named).group(1))
+            if channel not in routes:
+                routes[channel] = []
+                order.append(channel)
+            routes[channel].append((float(row['x']), float(row['y']),
+                                    float(row['z']), float(row['radius'])))
+    return kept + flush()
+
+
+handle = tempfile.NamedTemporaryFile('w', suffix='.pqr', delete=False)
+# The strided copy is written plain whatever the source is: it is read once,
+# straight away, by a PyMOL that would otherwise have to decompress it again.
+opener = gzip.open if channels.endswith('.gz') else open
+with opener(channels, 'rt') as source:
+    if channels[:-3].endswith('.cif') if channels.endswith('.gz') \
+            else channels.endswith('.cif'):
+        kept = strideCif(source, handle, stride)
+    else:
+        kept = stridePqr(source, handle, stride)
 handle.close()
 
 # Named apart from the file, not after it: a stray load of the same .pqr then
