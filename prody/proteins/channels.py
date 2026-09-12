@@ -1868,7 +1868,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     start_point_search=3.0, surf_radius=15, inner_radius=1.2, min_depth=5,
     min_volume=None, max_volume=None, max_depth=None, sparsity=6,
     cavities_only=False, diagram="homogenized", max_deviation=0.1,
-    route_divergence=0.2, return_details=False, output_format='pqr', **kwargs):
+    route_divergence=0.2, return_details=False, output_format='mmcif', **kwargs):
     """Computes and identifies channels within a molecular structure using 
     Voronoi and Delaunay tessellations.
 
@@ -1898,11 +1898,13 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
     :type atoms: `Atoms` object
 
     :arg output_path: Optional path to save the resulting channels and
-        associated data in PQR (or PDB) format. If None, results are not saved.
-        Default is None.
+        associated data. If None, results are not saved. Default is None. What
+        is written there is ``output_format``'s to decide: an mmCIF unless a PQR
+        is asked for.
 
         Naming a directory names nothing after the run: the files are named
-        after what they hold - ``channels.pqr`` beside ``links.pqr``, and with
+        after what they hold - ``channels.cif``, or under
+        ``output_format='pqr'`` ``channels.pqr`` beside ``links.pqr``, and with
         ``separate=True`` per-object files carrying no stem at all
         (``sp0_chl3.pqr``). Naming a file puts its stem on all of them
         (``run1.pqr`` gives ``run1_links.pqr`` and ``run1_sp0_chl3.pqr``), which
@@ -1923,15 +1925,16 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         A search that ran from a single start point tags nothing with it, every
         object having the same one, and writes ``out_chl3.pqr``.
 
-        Ignored for ``output_format="mmcif"``, which always writes one file.
+        Ignored for ``output_format="mmcif"``, the default, which always writes
+        one file; so this does nothing unless a PQR is asked for as well.
     :type separate: bool
 
-    :arg output_format: What ``output_path`` is written as; ``"pqr"`` (the
-        default) or ``"mmcif"``. The format is a property of the one output path
+    :arg output_format: What ``output_path`` is written as; ``"mmcif"`` (the
+        default) or ``"pqr"``. The format is a property of the one output path
         rather than a second path of its own, so a run has one place its results
         go. Anything else raises, rather than falling back on the default: a
-        misspelled format that quietly wrote PQR would be found only by opening
-        the file.
+        misspelled format that quietly wrote the other one would be found only by
+        opening the file.
 
         There is no ``"pdb"``. The flag picks the format family and the path
         picks the extension, which is how PDB has always been chosen here -
@@ -1943,8 +1946,8 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
         residues of every channel in one file, with keys joining them, which is
         what the PQR and the residue text files cannot express between them.
         Chamber links go into the same file under
-        ``_sb_ncbr_channel.type`` ``Path``, a directory takes ``channels.cif``,
-        and no viewer script is written, that being a PQR arrangement.
+        ``_sb_ncbr_channel.type`` ``Path``, and a directory takes
+        ``channels.cif``, with the viewer left beside it as for a PQR.
     :type output_format: str
 
     :arg start_point: Optional starting point for channel search. This can be
@@ -3189,7 +3192,7 @@ def calcChannels(atoms, output_path=None, separate=False, start_point=None,
 def calcPoresFromChannels(channels, details, min_end_to_end=None, max_end_to_end=None,
     min_bottleneck=None, max_bottleneck=None, min_length=None, max_length=None,
     min_volume=None, max_volume=None, output_path=None, separate=False,
-    output_format='pqr', atoms=None):
+    output_format='mmcif', atoms=None):
     """Construct potential pores from previously identified channels using 
     :func:`calcChannels`. This function performs a post-processing analysis of 
     channels and requires ``return_details`` set to ``True`` in :func:`calcChannels`.
@@ -3267,8 +3270,8 @@ def calcPoresFromChannels(channels, details, min_end_to_end=None, max_end_to_end
         Default is None.
     :type output_path: str or None
 
-    :arg output_format: What ``output_path`` is written as; ``"pqr"`` (the
-        default) or ``"mmcif"``, as in :func:`calcChannels`. A directory takes
+    :arg output_format: What ``output_path`` is written as; ``"mmcif"`` (the
+        default) or ``"pqr"``, as in :func:`calcChannels`. A directory takes
         ``pores.cif``, named apart from ``channels.cif`` so that a run writing
         both into one folder does not have the second overwrite the first.
         ``separate`` is ignored for mmCIF.
@@ -3896,11 +3899,13 @@ def calcChannelsMultipleFrames(atoms, trajectory=None, output_path=None,
     # to name the per-frame files. The schema describes one structure and has no
     # frame of its own, so a frame per file is what keeps each written file
     # something the schema can describe - the same arrangement the PQR path uses.
-    # A multi-model run writes an mmCIF unless it is told otherwise: it holds what
-    # ensemble processing reads in rather less room than the same frames as a PQR.
-    # The default is a format like any other - the caller passes one or takes this
-    # one - and the path names the file rather than choosing between them.
-    default_format = 'mmcif' if multimodel else 'pqr'
+    # Every run writes an mmCIF unless it is told otherwise, a multi-model one
+    # holding what ensemble processing reads in rather less room than the same
+    # frames as a PQR, and a per-frame one holding each frame as the schema can
+    # describe it. The default is a format like any other - the caller passes one
+    # or takes this one - and the path names the file rather than choosing
+    # between them.
+    default_format = 'mmcif'
 
     mmcif = _isMmcifFormat(kwargs.get('output_format', default_format), separate)
     frame_suffix = '.cif' if mmcif else '.pqr'
@@ -6350,7 +6355,7 @@ def calcPoresFromChannelsMultipleFrames(channels_all, details_all, output_path=N
     # Read rather than popped: the worker forwards the rest of kwargs to
     # calcPoresFromChannels, where the format takes effect. Wanted here only to
     # name the per-frame files.
-    mmcif = _isMmcifFormat(kwargs.get('output_format', 'pqr'), separate)
+    mmcif = _isMmcifFormat(kwargs.get('output_format', 'mmcif'), separate)
     frame_suffix = '.cif' if mmcif else '.pqr'
 
     # A directory takes the frames inside it, as everywhere else; anything else
@@ -9291,7 +9296,7 @@ def _pqrOutputPaths(output_path):
     return output_path, links_path, into_directory, separate_stem
 
 
-def _warnStaleOutputs(output_path, output_format='pqr', separate=False,
+def _warnStaleOutputs(output_path, output_format='mmcif', separate=False,
                       tags=('chl', 'lnk'), cif_path=None):
     """Name the files an earlier run left where this one has just written nothing.
 
@@ -9357,9 +9362,27 @@ def _cifOutputPath(path):
     if path.is_dir():
         return path / 'channels.cif'
 
-    if path.suffix.lower() == '.cif':
-        return path
-    return path.with_name(path.name + '.cif')
+    # A trailing .gz belongs to the file, not to the format; what has to name a
+    # channels file is the suffix beneath it, so channels.cif.gz is already named
+    # and must not collect a second .cif.
+    name = str(path)
+    zipped = name.endswith('.gz')
+    plain = name[:-3] if zipped else name
+
+    if plain.lower().endswith(('.pqr', '.pdb', '.cif')):
+        # Written under the name given, even where that name says the other
+        # format: renaming it would put the file somewhere the caller never asked
+        # for, and it would not be where they went looking. Said out loud
+        # instead, as the multi-model path says it, because otherwise the
+        # mismatch surfaces only in whatever opens the file next.
+        if not plain.lower().endswith('.cif'):
+            _warn('{0} is written as mmCIF, which its name does not say. The '
+                  'format decides what is written and the name was kept as '
+                  'given.'.format(path))
+    else:
+        plain = str(Path(plain).with_suffix('.cif'))
+
+    return Path(plain + ('.gz' if zipped else ''))
 
 
 def _isMmcifFormat(output_format, separate=False):
@@ -9391,7 +9414,7 @@ def _isMmcifFormat(output_format, separate=False):
         raise ValueError(
             "output_format must be 'pqr' or 'mmcif', not {0!r}.{1}".format(
                 output_format,
-                " For PDB rather than PQR, keep output_format='pqr' and give "
+                " For PDB rather than mmCIF, pass output_format='pqr' and give "
                 "output_path a .pdb suffix." if fmt == 'pdb' else ''))
 
     if separate:
@@ -13325,6 +13348,7 @@ import sys
 # with either in view.
 protein_file = None
 cif_file = None
+pqr_file = None
 channel_regex = None
 # A channels file that was found and deliberately turned away, which is not the
 # same as having found none, and must not be reported as though it were.
@@ -13346,6 +13370,20 @@ def holdsChannels(path):
         text = handle.read()
     return "_sb_ncbr_channel" in text or "_prody_channel" in text
 
+def holdsRoutes(path):
+    """Whether a PQR holds channels rather than a structure.
+
+    The routes this module writes are FIL residues; a protein handed over as the
+    backdrop is not. Either can be named on the command line with the same
+    extension, and a channels file taken for the protein would be drawn as the
+    structure and then reported as no channels at all.
+    """
+    with open(path) as handle:
+        for line in handle:
+            if line.startswith(("ATOM", "HETATM")) and line[17:20] == "FIL":
+                return True
+    return False
+
 for arg in sys.argv[1:]:
     # Only a structure counts as the protein, and PyMOL's own arguments are not
     # arguments to this. Invoked without the "--" separator, sys.argv still holds
@@ -13353,15 +13391,28 @@ for arg in sys.argv[1:]:
     # takes the session down rather than reporting anything.
     if arg == "--" or arg.startswith("-") or arg.lower().endswith(".py"):
         continue
-    if (os.path.isfile(arg) and arg.lower().endswith(".cif")
-            and holdsChannels(arg)):
+    if os.path.isfile(arg) and holdsChannels(arg):
+        # By content, not by extension: the format a run writes is its own to
+        # decide and the path only names the file, so an mmCIF can arrive under
+        # a .pqr name. The categories looked for appear in nothing else.
         if cif_file is None:
             cif_file = arg
+    elif (os.path.isfile(arg) and arg.lower().endswith((".pqr", ".pdb"))
+          and holdsRoutes(arg)):
+        # A run writes every channel into one file now, so a .pqr named here is
+        # as likely to be the channels as the backdrop. Told apart by content.
+        if pqr_file is None:
+            pqr_file = arg
     elif os.path.isfile(arg) and arg.lower().endswith((".pdb", ".ent", ".cif",
                                                        ".pqr")):
         if protein_file is None:
             protein_file = arg
-    elif channel_regex is None:
+    elif channel_regex is None and ("*" in arg or "?" in arg
+                                    or arg.lower().endswith((".pqr", ".pdb"))):
+        # Only something shaped like a glob. PyMOL leaves the payload of its own
+        # flags in sys.argv - `-d "print(...)"` among them - and taking any
+        # leftover word as the pattern turned one of those into the search for
+        # channel files, which then matched nothing and said so.
         channel_regex = arg
 
 if channel_regex is None:
@@ -13370,9 +13421,20 @@ if channel_regex is None:
 # Nothing named and no PQRs about: an mmCIF run leaves a single file, so look
 # for one before giving up.
 if cif_file is None and not glob.glob(channel_regex):
-    found = sorted(f for f in glob.glob("*.cif") if holdsChannels(f))
+    found = sorted(f for f in glob.glob("*.cif") + glob.glob("*.pqr")
+                   if holdsChannels(f))
     if found:
         cif_file = found[0]
+
+# The one file a PQR run writes when it is not asked to split itself. It carries
+# no number in its name, so the per-file glob above does not match it and never
+# did; it is split into its routes below instead, which is what makes the
+# per-channel files unnecessary rather than merely redundant.
+combined = []
+if pqr_file:
+    combined = [pqr_file]
+elif cif_file is None and not glob.glob(channel_regex):
+    combined = sorted(f for f in glob.glob("*.pqr") if holdsRoutes(f))
 
 def frameBlocks(path):
     """How many data_ blocks an mmCIF holds, counting no further than two."""
@@ -13567,6 +13629,55 @@ def loadCifChannels(path):
 
     return groups
 
+PQR_GROUPS = (("link", "link_grp", "link"), ("pore", "pore_grp", "pore"))
+
+def loadPqrChannels(path):
+    """Split a PQR holding many routes into one object each.
+
+    A run writes every route into one file, the residue number telling them
+    apart, and PyMOL loads that as a single object: the routes arrive as one
+    thing that cannot be hidden, coloured or measured apart, which is what the
+    per-channel files were for. Split here exactly as loadCifChannels splits an
+    mmCIF, so a run opens the same way whichever format it was written in.
+    """
+    group, prefix = "chnl_grp", "channel"
+    stem = os.path.basename(path).lower()
+    for word, named, tag in PQR_GROUPS:
+        if word in stem:
+            group, prefix = named, tag
+            break
+
+    routes = {}
+    with open(path) as handle:
+        for line in handle:
+            if line.startswith(("ATOM", "HETATM")) and line[17:20] == "FIL":
+                # Fixed columns: three %8.3f coordinates can run together
+                # without a space once one of them reaches -100.
+                index = int(line[22:26]) - 1
+                routes.setdefault(index, []).append(
+                    (float(line[30:38]), float(line[38:46]),
+                     float(line[46:54]), float(line[60:66])))
+
+    objects = []
+    for index in sorted(routes):
+        spheres = routes[index]
+        text = "".join(
+            "ATOM  %5d  H   FIL T%4d    %8.3f%8.3f%8.3f%6.2f%6.2f\n"
+            % (i + 1, i + 1, x, y, z, 1.00, radius)
+            for i, (x, y, z, radius) in enumerate(spheres))
+        colour = caverColour(index)
+        obj = freeName(f"{prefix}{index}")
+        cmd.read_pdbstr(text, obj)
+        radii_list = [radius for _, _, _, radius in spheres]
+        cmd.alter(obj, "vdw = radii_list.pop(0)",
+                  space={'radii_list': radii_list})
+        cmd.hide("everything", obj)
+        cmd.show("spheres", obj)
+        cmd.color(colour, obj)
+        objects.append(obj)
+        print(f"  {obj:<20s} {colour}  ({len(spheres)} spheres)")
+    return group, objects
+
 # both sets read their rank off the same 0-based scale, so the first channel of
 # either program is blue and the two stay comparable side by side
 sets = [("chnl_grp", sorted(glob.glob(channel_regex), key=natural_sort_key), False),
@@ -13586,6 +13697,21 @@ if cif_file:
     cmd.zoom()
     print(f"Success: {sum(len(o) for o in cif_groups.values())} object(s) "
           f"loaded from {cif_file}.")
+elif combined:
+    drawn = 0
+    for path in combined:
+        print(f"Splitting {os.path.basename(path)} into its routes:")
+        group, objects = loadPqrChannels(path)
+        if objects:
+            cmd.group(freeName(group), " ".join(objects))
+            drawn += len(objects)
+    cmd.rebuild()
+    cmd.set("sphere_scale", 1.0)
+    cmd.set("sphere_quality", 2)
+    cmd.bg_color("white")
+    cmd.zoom()
+    print(f"Success: {drawn} object(s) loaded from "
+          f"{', '.join(os.path.basename(p) for p in combined)}.")
 elif refused:
     # The only channels here were the ones turned away above, and that has been
     # explained already. Reporting none found would contradict it, and send the
